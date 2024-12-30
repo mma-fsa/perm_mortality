@@ -1,0 +1,511 @@
+---
+title: "Perm Mortality EDA"
+author: "Mike McPhee Anderson, FSA"
+date: "2024-12-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(splines)
+library(tidyselect)
+
+```
+
+# Setup
+
+## Load Study Data
+
+```{r}
+
+df_study_data <- read_rds("/mnt/data/ilec/perm_extract.rds")
+
+```
+
+## Append additional columns to study data
+
+* Setup the face amount as an ordered factor
+
+```{r}
+
+face_amount_order <- c(
+  "1-9999",
+  "10000-24999",
+  "25000-49999",
+  "50000-99999",
+  "100000-249999",
+  "250000-499999",
+  "500000-999999",
+  "1000000-2499999",
+  "2500000-4999999",
+  "5000000-9999999",
+  "10000000+"
+)
+
+df_study_data <- df_study_data %>%
+  mutate(
+    face_amount_band = ordered(face_amount_band, levels=!!face_amount_order),
+    face_amount_band_int = as.integer(face_amount_band),
+    face_amount_band_grp = forcats::fct_collapse(face_amount_band,
+      `<$25K` = c("1-9999", "10000-24999"),
+      `$25K-$99K` = c("25000-49999", "50000-99999"),
+      `$100K-$499K` = c("100000-249999", "250000-499999"),
+      `$500K-$999K` = c("500000-999999"),
+      `$1M-$2.499M` = c("1000000-2499999"),
+      `$2.5M-4.99M` = c("2500000-4999999"),
+      `$5M+` = c("5000000-9999999", "10000000+")
+    )
+  )
+
+```
+
+
+# EDA
+
+## Check Exposure by UW Class
+
+```{r}
+
+df_study_data %>% 
+  mutate(
+    uw_class_full = interaction(number_of_preferred_classes, preferred_class, smoker_status, gender)
+  ) %>%
+  filter(!is.na(qx)) %>%
+  group_by(uw_class_full) %>%
+  summarise(
+    exposure = sum(policies_exposed),
+    deaths = sum(number_of_deaths),
+    expected = sum(policies_exposed * qx)
+  ) %>%
+  mutate(
+    ae = deaths / expected
+  ) %>%
+  arrange(ae)
+
+```
+
+## Initial A/E Plots
+
+```{r fig.width=10}
+
+plot_data <- df_study_data %>% 
+  mutate(
+    uw_class_full = interaction(number_of_preferred_classes, preferred_class, smoker_status)
+  ) %>%
+  filter(!is.na(qx)) %>%
+  group_by(attained_age, uw_class_full, gender) %>%
+  summarise(
+    exposure = sum(policies_exposed),
+    deaths = sum(number_of_deaths),
+    expected = sum(policies_exposed * qx)
+  ) %>%
+  mutate(
+    ae = pmin(2, deaths / expected)
+  ) %>%
+  arrange(ae)
+
+ggplot(plot_data, aes(x=attained_age, y=ae, color=gender, group=gender)) +
+  facet_wrap(~ uw_class_full, scales="free_y") +
+  scale_y_continuous(trans=scales:::log_trans(), labels = scales::label_number(0.001)) +
+  geom_smooth(se = F, span=0.5) +
+  geom_hline(yintercept = 1) + 
+  theme_bw()
+
+```
+## Three Class, by duration
+
+* The data only supports a 10-15 year selection periods for all the classes
+
+```{r fig.height=3}
+
+plot_data <- df_study_data %>%
+  filter(number_of_preferred_classes == "3") %>%
+  group_by(gender, preferred_class, duration) %>%
+  summarise(
+    exposure = sum(policies_exposed),
+    deaths = sum(number_of_deaths),
+    expected = sum(policies_exposed * qx)
+  )
+
+ggplot(plot_data, aes(x=duration, y=deaths, fill=gender, group=gender)) +
+  facet_wrap(~ preferred_class) +
+  geom_bar(stat="identity", position = "dodge") +
+  theme_bw()
+
+```
+
+## Two Class, by Duration
+
+* These would support up to a 25 year selection period
+
+```{r}
+
+plot_data <- df_study_data %>%
+  filter(number_of_preferred_classes == "2") %>%
+  mutate(uw_class = interaction(preferred_class, smoker_status)) %>%
+  group_by(gender, uw_class, duration) %>%
+  summarise(
+    exposure = sum(policies_exposed),
+    deaths = sum(number_of_deaths),
+    expected = sum(policies_exposed * qx)
+  )
+
+ggplot(plot_data, aes(x=duration, y=deaths, fill=gender, group=gender)) +
+  facet_wrap(~ uw_class) +
+  geom_bar(stat="identity", position = "dodge") +
+  theme_bw()
+
+```
+
+## Smoker Distinct (one class)
+
+* More recently issue policies might be final-expense type policies
+
+```{r }
+
+plot_data <- df_study_data %>%
+  filter(number_of_preferred_classes == "NA") %>%
+  group_by(gender, smoker_status, duration) %>%
+  summarise(
+    exposure = sum(policies_exposed),
+    deaths = sum(number_of_deaths),
+    expected = sum(policies_exposed * qx)
+  )
+
+ggplot(plot_data, aes(x=duration, y=deaths, fill=gender, group=gender)) +
+  facet_wrap(~ smoker_status) +
+  geom_bar(stat="identity", position = "dodge") +
+  theme_bw()
+
+
+```
+
+## Face Amount vs. Issue Year (smoker distinct, NS only)
+
+Check for final-expense / simplified issue type policies
+
+* Based on the cliff at the higher face amounts, looks like mostly final expense for 2005 and after
+
+* Weird spike around 2015
+
+```{r}
+
+plot_data <- df_study_data %>%
+  filter(number_of_preferred_classes == "NA",
+         smoker_status == "NONSMOKER") %>%
+  group_by(face_amount_band_grp, issue_year) %>%
+  summarise(
+    exposure = sum(policies_exposed),
+    deaths = sum(number_of_deaths),
+    expected = sum(policies_exposed * qx)
+  )
+
+ggplot(plot_data, aes(x=issue_year, y=exposure)) +
+  facet_wrap(~ face_amount_band_grp, scales="free_y") +
+  geom_bar(stat="identity") +
+  geom_vline(xintercept = 2004, color="red") +
+  geom_vline(xintercept = 2015, color="blue")
+
+```
+
+```{r}
+
+plot_data <- df_study_data %>%
+  filter(number_of_preferred_classes == "NA",
+         smoker_status == "SMOKER") %>%
+  group_by(face_amount_band_grp, issue_year) %>%
+  summarise(
+    exposure = sum(policies_exposed),
+    deaths = sum(number_of_deaths),
+    expected = sum(policies_exposed * qx)
+  )
+
+ggplot(plot_data, aes(x=issue_year, y=exposure)) +
+  facet_wrap(~ face_amount_band_grp, scales="free_y") +
+  geom_bar(stat="identity") +
+  geom_vline(xintercept = 2004, color="red")
+
+```
+
+## Face amount vs. Issue Year (2 class NS)
+
+```{r}
+
+plot_data <- df_study_data %>%
+  filter(number_of_preferred_classes == "2",
+         smoker_status == "NONSMOKER") %>%
+  group_by(face_amount_band_grp, issue_year) %>%
+  summarise(
+    exposure = sum(policies_exposed),
+    deaths = sum(number_of_deaths),
+    expected = sum(policies_exposed * qx)
+  )
+
+ggplot(plot_data, aes(x=issue_year, y=exposure)) +
+  facet_wrap(~ face_amount_band_grp, scales="free_y") +
+  geom_bar(stat="identity") 
+
+```
+
+# Mortality Improvement
+
+## Non-smokers
+
+### Evaluate knot locations
+
+Very heavily skewed towards old age deaths, looks like first knot should be
+places around 50 (5% of the deaths), second around 65.
+
+```{r}
+
+plot_data <- df_study_data %>%
+  filter(
+    smoker_status == "NONSMOKER",
+    attained_age >= 25,
+    attained_age <= 90) %>%
+  group_by(attained_age, gender) %>%
+  summarise(
+    n_deaths = sum(number_of_deaths)
+  ) %>%
+  ungroup() %>%
+  group_by(gender) %>%
+  arrange(attained_age) %>%
+  mutate(
+    cumulative_pct_of_deaths = cumsum(n_deaths) / sum(n_deaths)
+  ) 
+
+ggplot(plot_data, aes(x=attained_age, y=cumulative_pct_of_deaths, group=gender, color=gender)) +
+  geom_line() +
+  scale_y_continuous(
+    labels = scales::percent_format(), 
+    transform = scales::pseudo_log_trans(sigma = 0.01),
+    breaks=seq(0,1,by=0.1)) +
+  scale_x_continuous(breaks=seq(0, 120, by=10)) +
+  # eye-ball first knot location
+  geom_hline(yintercept = 0.05) +
+  geom_vline(xintercept = 50) +
+  # eye-ball second knot location
+  geom_hline(yintercept = 0.15) +
+  geom_vline(xintercept = 65) +
+  xlab("Attained Age") +
+  ylab("Cumulative % of Deaths") +
+  theme_bw()
+
+```
+
+### Build inferential model
+
+By accounting for the other time variables (attained age + duration), we can see
+what is left over by observation (calendar) year.  This will give us a starting 
+point for a mortality improvement assumption.  Cap the duration at 20, since 
+underwriting should largely be worn-off by that time.
+
+```{r}
+
+df_model_data <- df_study_data %>%
+  filter(smoker_status == "NONSMOKER",
+         number_of_preferred_classes != "NA",
+         attained_age >= 25,
+         attained_age <= 90) %>%
+  mutate(
+    gender = factor(gender, levels=c("MALE", "FEMALE")),
+    capped_duration = pmin(20, duration),
+    expected_claims = qx * policies_exposed,
+    face_amount_band = ordered(face_amount_band, levels=!!face_amount_order),
+    face_amount_band_int = as.integer(face_amount_band)
+  ) %>%
+  filter(face_amount_band_int > 2) %>%
+  group_by(observation_year, gender, attained_age, capped_duration, face_amount_band, face_amount_band_int) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    expected_claims = sum(expected_claims),
+    .groups="drop") %>%
+  ungroup() %>%
+  filter(expected_claims > 0)
+
+X_mat <- model.matrix(
+  number_of_deaths ~ gender * 
+    splines::ns(attained_age, Boundary.knots = c(25, 90), knots = c(35, 45, 55, 65, 75, 85)) *
+    splines::ns(capped_duration, Boundary.knots=c(1, 20), knots = c(5, 10, 15)) - 1,
+  data=df_model_data
+)
+
+X_offset <- log(df_model_data$expected_claims)
+
+y_mat <- df_model_data$number_of_deaths
+
+```
+
+#### Run CV
+
+Select the lambda for the lasso based on a rudimentary CV.
+
+```{r}
+
+cv_model <- cv.glmnet(
+  X_mat,
+  y_mat,
+  family="poisson",
+  offset=X_offset,
+  fit_intercept=T
+)
+
+cv_model
+
+```
+
+#### Build Model
+
+Fit the model and plot the lambda selected via CV
+
+```{r}
+
+glmnet_model <- glmnet::glmnet(
+  X_mat,
+  y_mat,
+  family="poisson",
+  offset=X_offset,
+  fit_intercept=T
+)
+
+lambda_diff <- abs(glmnet_model$lambda - cv_model$lambda.1se)
+
+LAMBDA_INDEX <- which(lambda_diff == min(lambda_diff))
+
+best_lambda_value <- glmnet_model$lambda[LAMBDA_INDEX]
+
+plot(glmnet_model$dev.ratio, type="l")
+points(LAMBDA_INDEX, glmnet_model$dev.ratio[LAMBDA_INDEX])
+
+```
+
+
+#### Check Model
+
+```{r}
+
+model_pred <- predict(
+  glmnet_model,
+  newx=X_mat,
+  newoffset = X_offset,
+  s=best_lambda_value,
+  type = "response")
+
+df_model_data$model_pred <- model_pred
+
+# sanity check
+sum(df_model_data$number_of_deaths) / sum(model_pred)
+
+```
+
+#### Look for any major areas of poor fit
+
+Use a decision tree to evaluate the model fit / residuals on the training set.
+
+* Early durations don't look great, but there aren't a lot of deaths
+
+```{r}
+
+model_errors <- as.matrix(df_model_data[,c("model_pred","number_of_deaths")])
+
+rpart_model <- rpart(
+  model_errors ~ capped_duration + attained_age + gender,
+  data=df_model_data,
+  method="poisson",
+  control = rpart.control(cp=0.001, maxdepth = 3))
+
+rpart.plot(rpart_model, digits=3)
+
+```
+#### Check Mortality Improvement
+
+* Evidence of improvement between 55 and 75
+
+```{r}
+
+age_cuts <- c(-Inf, seq(35, 85, by=10), Inf)
+
+plot_data <- df_model_data %>%
+  filter(observation_year < 2018) %>%
+  mutate(
+    age_group = cut(attained_age, breaks=!!age_cuts)
+  ) %>%
+  group_by(age_group, gender, observation_year) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    model_pred = sum(model_pred),
+    .groups="drop"
+  ) %>%
+  ungroup()
+
+ggplot(plot_data, aes(x=observation_year, y=log(number_of_deaths/model_pred), color=gender, group=gender)) +
+  facet_wrap(~ age_group, scales="free_y") +
+  geom_line() +
+  geom_smooth(method="lm", se=F) +
+  ggtitle("Mortality Improvement Check") +
+  theme_bw() +
+  xlab("Observation Year") +
+  ylab("Log A/E")
+
+```
+
+No improvement in 75-85, regardless of the face amounts
+
+```{r}
+
+plot_data <- df_model_data %>%
+  filter(observation_year < 2018) %>%
+  mutate(
+    age_group = cut(attained_age, breaks=!!age_cuts)
+  ) %>%
+  filter(age_group == "(75,85]") %>%
+  group_by(face_amount_band, gender, observation_year) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    model_pred = sum(model_pred),
+    .groups="drop"
+  ) %>%
+  ungroup()
+
+ggplot(plot_data, aes(x=observation_year, y=log(number_of_deaths/model_pred), color=gender, group=gender)) +
+  facet_wrap(~ face_amount_band, scales="free_y") +
+  geom_line() +
+  geom_smooth(method="lm", se=F) +
+  ggtitle("Mortality Improvement Check - 75 to 84") +
+  theme_bw() +
+  xlab("Observation Year") +
+  ylab("Log A/E")
+
+```
+
+No strong evidence of improvement at 85+
+
+```{r}
+
+plot_data <- df_model_data %>%
+  filter(observation_year < 2018) %>%
+  mutate(
+    age_group = cut(attained_age, breaks=!!age_cuts)
+  ) %>%
+  filter(age_group == "(85, Inf]") %>%
+  group_by(face_amount_band, gender, observation_year) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    model_pred = sum(model_pred),
+    .groups="drop"
+  ) %>%
+  ungroup()
+
+ggplot(plot_data, aes(x=observation_year, y=log(number_of_deaths/model_pred), color=gender, group=gender)) +
+  facet_wrap(~ face_amount_band, scales="free_y") +
+  geom_line() +
+  geom_smooth(method="lm", se=F) +
+  ggtitle("Mortality Improvement Check - 85+") +
+  theme_bw() +
+  xlab("Observation Year") +
+  ylab("Log A/E")
+
+```

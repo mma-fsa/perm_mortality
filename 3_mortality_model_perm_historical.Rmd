@@ -1,0 +1,733 @@
+---
+title: "Perm Mortality Model"
+author: "Mike McPhee Anderson, FSA"
+date: "2024-12-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(glmnet)
+library(xgboost)
+library(recipes)
+library(rpart)
+library(rpart.plot)
+library(splines)
+library(rsample)
+library(shapviz)
+library(tidyselect)
+library(doMC)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# Overview
+
+## Models
+
+Within the ILEC data "Perm" (permanent) life insurance category, there
+are some major differences in the underwriting / target market that can be inferred via EDA. 
+These differences lead us to three distinct models:
+
+ 1. *Simplified Issue:* Policies issued after 2005 without any preferred classes are likely simplified
+   issue.  These policies are less than $100K face amount, and are likely to have less stringent underwriting.
+   
+ 2. *Fully Underwritten (recent):*  Post-2005 policies are likely to have at least one preferred class, and I recall that blood testing gained traction in the late 1990s.  These policies will also have some underwriting class selection (select period) that is still applicable.
+ 
+ 3. *Fully Underwritten (historical):*  Policies prior to 2005 are likely to have little remaining effects from underwriting selection.  Also, this data is unlikely to have preferred classes, and is mostly just smoker vs. non-smoker for underwriting classes.  The majority of it will be smaller face amounts.
+ 
+## Training and Testing Splits
+
+Unfortunately, the ILEC data is aggregated in such a way that makes a typical train / test split cumbersome While we could sample the exposures and deaths for each aggregated cell, things like fractional exposures and the actuarial custom of setting deaths to have a full year of exposure introduce some opportunities for noise.  
+
+Instead, we'll use the most recent two years of data for testing, and perform cross-validation within the training set by observation year.  This is more closely aligned with what an "unseen observation" is in practice, i.e., another calendar year of data.  
+
+# Setup 
+
+## Load Data
+
+```{r}
+
+face_amount_order <- c(
+  "1-9999",
+  "10000-24999",
+  "25000-49999",
+  "50000-99999",
+  "100000-249999",
+  "250000-499999",
+  "500000-999999",
+  "1000000-2499999",
+  "2500000-4999999",
+  "5000000-9999999",
+  "10000000+"
+)
+
+df_study_data <- read_rds("/mnt/data/ilec/perm_extract.rds") %>%
+  mutate(
+    dataset = case_when(
+      (issue_year >= 2005) & (number_of_preferred_classes == "NA") ~ "simplified_issue",
+      (issue_year >= 1998) & (number_of_preferred_classes != "NA") ~ "perm_recent",
+      TRUE ~ "perm_historical"
+    ),
+    train_test = ifelse(observation_year >= 2016, "TEST", "TRAIN"),
+    # no selection period, just ultimate mortality
+    expected_deaths_08_vbt_ult = coalesce(qx * policies_exposed),
+    # create ordered factor + integer representation of face amount bands
+    face_amount_band = ordered(face_amount_band, levels=!!face_amount_order),
+    face_amount_band_int = as.integer(face_amount_band)
+  ) %>%
+  filter(expected_deaths_08_vbt_ult > 0)
+
+```
+
+# Perm Historical Model
+
+## Train Test Split
+
+```{r}
+
+df_ph_data <- df_study_data %>%
+  filter(dataset == "perm_historical")
+
+df_ph_data.train <- df_ph_data %>% 
+  filter(train_test == "TRAIN")
+
+df_ph_data.test <- df_ph_data %>%
+  filter(train_test == "TEST")
+
+df_ph_data %>%
+  group_by(train_test) %>%
+  summarise(
+    n_deaths = sum(number_of_deaths),
+    .groups="drop"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    pct_deaths = n_deaths / sum(n_deaths)
+  )
+
+```
+
+## Xgboost Model
+
+```{r}
+
+df_ph_data.train %>%
+  group_by(smoker_status, number_of_preferred_classes, preferred_class) %>%
+  summarise(
+    n_deaths = sum(number_of_deaths)
+  )
+
+```
+
+
+```{r}
+
+colnames(df_ph_data.train)
+
+```
+
+
+```{r}
+summary(df_ph_data.train)
+```
+
+```{r}
+
+# used by the GLM as well
+step_my_model_factor_prep <- function(recipe) {
+  recipe %>% step_mutate(
+    # group 3-class with the 2-class, there isn't much of it
+    preferred_class = case_when(
+      # group super-pref & pref (3-class) as pref in the 2-class
+      (number_of_preferred_classes == "3") & (preferred_class %in% c("1", "2")) ~ "1",
+      # group standard as standard in the 2-class
+      (number_of_preferred_classes == "3") & (preferred_class %in% c("3")) ~ "2",
+      # set the NA (smoker distinct) classes to be "standard" in the two class, the
+      # number of classes will be available to the model, but this gives it the option
+      # of grouping standard in 2 class w/ the non-preferred classes, it also makes
+      # default levels cleaner
+      (number_of_preferred_classes == "NA") ~ "2",
+      TRUE ~ preferred_class
+    ),
+    # set 3-class as 2-class, since applied the grouping above
+    number_of_preferred_classes = case_when(
+      number_of_preferred_classes == "3" ~ "2",
+      number_of_preferred_classes == "NA" ~ "1",
+      TRUE ~ number_of_preferred_classes
+    ),
+    # set factors w/ default levels
+    number_of_preferred_classes = factor(number_of_preferred_classes, levels=c("1", "2")),
+    preferred_class = factor(preferred_class, levels=c("2", "1")),
+    smoker_status = factor(smoker_status, levels=c("NONSMOKER", "SMOKER")),
+    gender = factor(gender, levels=c("MALE", "FEMALE"))
+  ) 
+}
+
+ph.xgb.recipe <- recipe(~ attained_age + gender + smoker_status + duration +
+                          face_amount_band_int + number_of_preferred_classes + preferred_class,
+                        data=df_ph_data.train) %>%
+  step_my_model_factor_prep() %>%
+  step_dummy(all_factor_predictors()) %>%
+  prep(df_ph_data.train, retain=F)
+
+
+get_ph_xgb_mat <- function(ph.xgb.recipe, df_ph_data) {
+  
+  X_mat <- bake(ph.xgb.recipe, df_ph_data) %>% 
+    as.matrix()
+  y_vec <- df_ph_data$number_of_deaths
+  offset_vec <- log(df_ph_data$expected_deaths_08_vbt_ult)
+  
+  list(
+    "xgb_mat" = xgb.DMatrix(X_mat, label=y_vec, base_margin=offset_vec),
+    "X" = X_mat,
+    "y" = y_vec,
+    "offset" = offset_vec
+  )
+}
+
+X.train <- get_ph_xgb_mat(ph.xgb.recipe, df_ph_data.train)
+X.test <- get_ph_xgb_mat(ph.xgb.recipe, df_ph_data.test)
+
+```
+
+### Run the inferential model
+
+```{r}
+
+xgb_params <- list(
+  "eta" = 0.1,
+  "gamma" = 3,
+  "max_depth" = 3,
+  "subsample" = 0.5,
+  "colsample_bytree" = 0.7,
+  "objective" = "count:poisson"
+)
+
+xgb_model <- xgboost::xgb.train(
+  params = xgb_params,
+  X.train$xgb_mat,
+  nrounds = 1000,
+  watchlist = list(validation=X.test$xgb_mat),
+  early_stopping_rounds = 10,
+  nthread=-1,
+  print_every_n = 100
+)
+
+## sanity check
+list(
+  "train a/e" = round(sum(X.train$y) / sum(predict(xgb_model, X.train$xgb_mat)), 3),
+  "test a/e" = round(sum(X.test$y) / sum(predict(xgb_model, X.test$xgb_mat)), 3)
+)
+
+```
+
+### Identify most important effect(s) and interaction(s)
+
+```{r}
+
+xgboost::xgb.plot.shap(X.test$X, top_n = 6, model=xgb_model, n_col=2)
+
+```
+
+Face amount and attained age interaction is visible from below plot.
+
+```{r}
+
+sv <- shapviz::shapviz(xgb_model, 
+                       X_pred = X.train$xgb_mat,
+                       X = X.train$X)
+
+```
+
+
+
+```{r}
+
+sv_dependence(sv, "attained_age")
+
+```
+
+```{r}
+
+sv_dependence(sv, "duration", color_var="attained_age")
+
+```
+
+
+## Build GLM
+
+### Identify spline locations
+
+Eyeball percentiles from SHAP plots and the cumulative percent of claims (percentiles).
+
+ * The aggregated data makes estimating percentiles using built-in functions difficult, so use the plots
+
+```{r}
+
+attage_ptiles <- df_ph_data.train %>%
+  group_by(attained_age) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    .groups = "drop"
+  ) %>%
+  ungroup() %>%
+  arrange(attained_age) %>%
+  mutate(
+    cumulative_number_of_deaths = cumsum(number_of_deaths),
+    cumulative_pct = cumulative_number_of_deaths / sum(number_of_deaths)
+  )
+
+ggplot(attage_ptiles, aes(x=attained_age, y=cumulative_pct)) +
+  geom_line() +
+  scale_y_continuous(breaks=seq(0, 1, by=0.1)) +
+  theme_bw()
+
+
+```
+
+```{r}
+
+face_ptiles <- df_ph_data.train %>%
+  group_by(face_amount_band_int) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    .groups = "drop"
+  ) %>%
+  ungroup() %>%
+  arrange(face_amount_band_int) %>%
+  mutate(
+    cumulative_number_of_deaths = cumsum(number_of_deaths),
+    cumulative_pct = cumulative_number_of_deaths / sum(number_of_deaths)
+  )
+
+ggplot(face_ptiles, aes(x=face_amount_band_int, y=cumulative_pct)) +
+  geom_line() +
+  scale_y_continuous(breaks=seq(0, 1, by=0.1)) +
+  theme_bw()
+
+```
+
+```{r}
+
+colnames(df_ph_data.train)
+
+```
+
+
+```{r}
+
+# prep dataframe for model matrix
+ph.glmnet.recipe <- recipe(number_of_deaths ~ face_amount_band_int + attained_age + duration + smoker_status +
+                             gender + number_of_preferred_classes + preferred_class + observation_year + issue_year,
+                           data = df_ph_data.train) %>%
+  step_my_model_factor_prep() %>%
+  step_mutate(
+    attained_age = pmin(95, attained_age),
+    duration = pmin(20, duration),
+    # lower face ans younger ages have something weird going on (unusually hihg mortality),
+    # and there are a lot of claims.  Maybe a worksite-type product?
+    lower_face_young_attage_ind = ifelse(
+      (face_amount_band_int <= 2) & (attained_age <= 50), "Y", "N"),
+    lower_face_young_attage_ind = factor(lower_face_young_attage_ind, levels=c("N", "Y"))
+  ) %>%
+  prep(df_ph_data.train, retain=F)
+
+# glmnet model formula
+model_formula.ph <- number_of_deaths ~ 
+  # glmnet handles the coefficient
+  -1 + 
+  # face amount & attained age interaction
+  gender * splines::bs(face_amount_band_int, Boundary.knots = c(1, 11), knots = c(3, 5, 7), degree=1) *
+  splines::ns(attained_age, Boundary.knots = c(25, 95), knots=c(35, 45, 55, 65, 75, 85)) +
+  number_of_preferred_classes * gender * (preferred_class:smoker_status) +
+  (number_of_preferred_classes:preferred_class) * log(duration) + 
+  lower_face_young_attage_ind * smoker_status * 
+    splines::bs(issue_year, Boundary.knots = c(1981, 2004), knots = c(1990, 1995), degree=1)
+
+# setup the data for glmnet
+prep_glmnet_data.ph <- function(df, model_formula, model_recipe) {
+  
+  if (any(coalesce(df$expected_deaths_08_vbt_ult, 0) <= 0)) {
+    stop("expected_deaths_08_vbt_ult cannot be zero / NA")
+  }
+  
+  list(
+    "df" = df,
+    "X" = model.matrix(model_formula, data=bake(model_recipe, df)),
+    "offset" = log(df$expected_deaths_08_vbt_ult),
+    "y" = df$number_of_deaths
+  )
+}
+
+glmnet_ph_data.train <- prep_glmnet_data.ph(df_ph_data.train, model_formula.ph, ph.glmnet.recipe)
+glmnet_ph_data.test <- prep_glmnet_data.ph(df_ph_data.test, model_formula.ph, ph.glmnet.recipe)
+
+```
+
+### Cross validation
+
+* By calendar/observation year
+
+```{r}
+
+# the more complex the model, the more memory intensive it becomes (larger design matrix),
+# so watch the system memory usage and configure the cores accordingly.  Also, there are at most
+# 7 folds, so core values larger than that will have no effect
+doMC::registerDoMC(cores=4)
+
+# 7 observation years in the training set
+ph_fold_ids <- df_ph_data.train$observation_year - min(df_ph_data.train$observation_year) + 1
+
+glmnet_cv.ph <- glmnet::cv.glmnet(
+  glmnet_ph_data.train$X,
+  glmnet_ph_data.train$y,
+  family="poisson",
+  offset = glmnet_ph_data.train$offset,
+  foldid = ph_fold_ids,
+  parallel = T
+)
+
+print(glmnet_cv.ph)
+
+```
+
+```{r}
+plot(glmnet_cv.ph)
+```
+
+### Train Full Model
+
+```{r}
+
+# no penalty on younger age factor / low face amount factor due to
+# unusually bad experience.  We want to fit this closely, since it worsens
+# in the subsequent years contained in the testing set.  If the data was 
+# disaggregated, we could simply identify the source of this unusually bad experience,
+# but since it isn't we'll have to include it. 
+glmnet_penalties.ph <- rep(1, ncol(glmnet_ph_data.train$X))
+
+younger_low_face_idx <- which(
+  stringr::str_detect(colnames(glmnet_ph_data.train$X), ".*lower_face_young_attage_ind.*"))
+
+glmnet_penalties.ph[younger_low_face_idx] <- 0
+
+issue_year_idx <- which(
+  stringr::str_detect(colnames(glmnet_ph_data.train$X), ".*issue_year*"))
+
+glmnet_penalties.ph[issue_year_idx] <- 0
+
+duration_idx <- which(
+  stringr::str_detect(colnames(glmnet_ph_data.train$X), ".*duration.*"))
+
+glmnet_penalties.ph[duration_idx] <- 0
+
+glmnet_fit.ph <- glmnet::glmnet(
+  glmnet_ph_data.train$X,
+  glmnet_ph_data.train$y,
+  family="poisson",
+  penalty.factor = glmnet_penalties.ph,
+  offset=glmnet_ph_data.train$offset
+)
+
+```
+
+```{r}
+
+# the cross validation values from 1se are too low, use a manual value instead
+MANUAL_LAMBDA_IDX <- 55
+MANUAL_LAMBDA_VALUE <- glmnet_fit.ph$lambda[MANUAL_LAMBDA_IDX]
+
+plot(glmnet_fit.ph$dev.ratio, type="l")
+points(MANUAL_LAMBDA_IDX, glmnet_fit.ph$dev.ratio[MANUAL_LAMBDA_IDX])
+title(sprintf("log(Lambda) = %.2f", log(MANUAL_LAMBDA_VALUE)))
+
+```
+
+### Run Predictions on the training set
+
+```{r}
+
+glmnet_ph_data.train[["pred"]] <- predict(
+  glmnet_fit.ph,
+  glmnet_ph_data.train$X,
+  s=MANUAL_LAMBDA_VALUE,
+  type="response",
+  newoffset=glmnet_ph_data.train$offset) %>% c()
+
+sum(glmnet_ph_data.train$y) - sum(glmnet_ph_data.train$pred)
+
+```
+
+### Run Predictions on the testing set
+
+```{r}
+
+glmnet_ph_data.test[["pred"]] <- predict(
+  glmnet_fit.ph,
+  glmnet_ph_data.test$X,
+  s=MANUAL_LAMBDA_VALUE,
+  type="response",
+  newoffset=glmnet_ph_data.test$offset) %>% c()
+
+sum(glmnet_ph_data.test$y) / sum(glmnet_ph_data.test$pred)
+
+
+```
+
+
+## Check Attained Age fit by face
+
+### Training Data
+
+```{r}
+
+apply_face_groups <- function(df) {
+  df %>% mutate(
+    face_amount_band_group = forcats::fct_collapse(
+      face_amount_band,
+      `<$25K` = c("1-9999", "10000-24999"),
+      `$25K-$99K` = c("25000-49999", "50000-99999"),
+      `$100K-$249K` = c("100000-249999"),
+      `$250K-$500K` = c("250000-499999"),
+      `$500K-$999K` = c("500000-999999"),
+      `$1M-$2.5M` = c("1000000-2499999"),
+      `$2.5M+` = c("2500000-4999999", "5000000-9999999", "10000000+")
+    )
+  )
+}
+
+plot_data.train <- bind_cols(
+  glmnet_ph_data.train$df,
+  tibble(pred = glmnet_ph_data.train$pred)
+)
+
+plot_data <- plot_data.train %>%
+  apply_face_groups %>%
+  group_by(attained_age, face_amount_band_group) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    expected_deaths_08_vbt_ult = sum(expected_deaths_08_vbt_ult),
+    pred = sum(pred),
+    .groups="drop"
+  ) %>%
+  ungroup() 
+
+ggplot(plot_data %>% pivot_longer(cols=-c(attained_age, face_amount_band_group)), 
+  aes(x=attained_age, y=value, color=name, group=name)) +
+  geom_line() +
+  theme_bw() +
+  facet_wrap(~ face_amount_band_group, ncol=3, scales="free_y") +
+  theme(
+    legend.position = "top"
+  )
+
+```
+```{r}
+
+ggplot(plot_data, aes(x=attained_age, y=log(number_of_deaths/pred))) +
+  geom_line() +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  facet_wrap(~ face_amount_band_group, ncol=3, scales="free_y") +
+  theme(
+    legend.position = "top"
+  )
+
+```
+
+```{r}
+
+# there is something weird going on at younger ages and low face amounts,
+# check that we've fixed it
+plot_data %>% 
+  filter(attained_age < 50) %>%
+  group_by(face_amount_band_group) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    pred = sum(pred),
+    .groups="drop"
+  ) %>%
+  mutate(`Actual/Predicted` = number_of_deaths / pred)
+
+```
+
+### Check duration 
+
+```{r}
+
+plot_data <- plot_data.train %>%
+  apply_face_groups() %>%
+  group_by(duration, preferred_class) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    expected_deaths_08_vbt_ult = sum(expected_deaths_08_vbt_ult),
+    pred = sum(pred),
+    .groups="drop"
+  ) %>%
+  ungroup() 
+
+ggplot(plot_data, aes(x=duration, y=log(number_of_deaths/pred))) +
+  geom_line() +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  facet_wrap(~ preferred_class, ncol=3, scales="free_y") +
+  theme(
+    legend.position = "top"
+  )
+
+
+```
+
+
+
+```{r}
+
+plot_data.test <- bind_cols(
+  glmnet_ph_data.test$df,
+  tibble(pred = glmnet_ph_data.test$pred)
+)
+
+plot_data <- plot_data.test %>%
+  apply_face_groups %>%
+  group_by(attained_age, face_amount_band_group) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    expected_deaths_08_vbt_ult = sum(expected_deaths_08_vbt_ult),
+    pred = sum(pred),
+    .groups="drop"
+  ) %>%
+  ungroup() 
+
+ggplot(plot_data %>% pivot_longer(cols=-c(attained_age, face_amount_band_group)), 
+  aes(x=attained_age, y=value, color=name, group=name)) +
+  geom_line() +
+  theme_bw() +
+  facet_wrap(~ face_amount_band_group, ncol=3, scales="free_y") +
+  theme(
+    legend.position = "top"
+  )
+
+
+```
+```{r}
+
+ggplot(plot_data, aes(x=attained_age, y=log(number_of_deaths/pred))) +
+  geom_line() +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  facet_wrap(~ face_amount_band_group, ncol=3, scales="free_y") +
+  theme(
+    legend.position = "top"
+  )
+
+
+```
+```{r}
+
+# the poor mortality experience at low face amounts is increasing in more recent
+# calendar years, since the training set is spot-on, not much more we can do from the
+# model's standpoint
+plot_data %>% 
+  filter(attained_age < 40) %>%
+  group_by(face_amount_band_group) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    pred = sum(pred),
+    .groups="drop"
+  ) %>%
+  mutate(`Actual/Predicted` = number_of_deaths / pred)
+
+```
+
+### Dig into <40 experience
+
+```{r}
+
+rpart_data <- bind_cols(
+  glmnet_ph_data.train$df,
+  tibble(pred = glmnet_ph_data.train$pred)) %>%
+  filter(attained_age < 40)
+
+model_errors <- as.matrix(rpart_data[,c("pred","number_of_deaths")])
+
+rpart_model <- rpart(
+  model_errors ~ issue_year + number_of_preferred_classes + preferred_class + gender + smoker_status,
+  data=rpart_data,
+  method="poisson",
+  control = rpart.control(cp=0.0001, maxdepth = 3))
+
+rpart.plot(rpart_model, digits=3)
+
+```
+
+### Over 40 experience
+
+```{r}
+
+rpart_data <- bind_cols(
+  glmnet_ph_data.train$df,
+  tibble(pred = glmnet_ph_data.train$pred)) %>%
+  filter(attained_age >= 40)
+
+model_errors <- as.matrix(rpart_data[,c("pred","number_of_deaths")])
+
+rpart_model <- rpart(
+  model_errors ~ issue_year + number_of_preferred_classes + preferred_class + 
+    gender + smoker_status + attained_age,
+  data=rpart_data,
+  method="poisson",
+  control = rpart.control(cp=0.0001, maxdepth = 3))
+
+rpart.plot(rpart_model, digits=3)
+
+```
+
+```{r}
+
+rpart_data <- bind_cols(
+  glmnet_ph_data.test$df,
+  tibble(pred = glmnet_ph_data.test$pred)) %>%
+  filter(attained_age < 40)
+
+model_errors <- as.matrix(rpart_data[,c("pred","number_of_deaths")])
+
+rpart_model <- rpart(
+  model_errors ~ issue_year + number_of_preferred_classes + preferred_class + gender + smoker_status + attained_age,
+  data=rpart_data,
+  method="poisson",
+  control = rpart.control(cp=0.0001, maxdepth = 3))
+
+rpart.plot(rpart_model, digits=3)
+
+```
+
+```{r}
+
+rpart_data <- bind_cols(
+  glmnet_ph_data.test$df,
+  tibble(pred = glmnet_ph_data.test$pred)) %>%
+  filter(attained_age >= 40)
+
+model_errors <- as.matrix(rpart_data[,c("pred","number_of_deaths")])
+
+rpart_model <- rpart(
+  model_errors ~ issue_year + number_of_preferred_classes + preferred_class + gender + smoker_status + attained_age + duration,
+  data=rpart_data,
+  method="poisson",
+  control = rpart.control(cp=0.0001, maxdepth = 3))
+
+rpart.plot(rpart_model, digits=3)
+
+```
+
+```{r}
+
+df_ph_data %>%
+  write_rds("/mnt/data/ilec/ilec_perm_historical.rds", compress="gz")
+
+```
+
+
