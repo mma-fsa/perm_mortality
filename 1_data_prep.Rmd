@@ -1,8 +1,12 @@
 ---
-title: "Perm Mortality Data"
+title: "Perm Mortality Data Preparation"
 author: "Mike McPhee Anderson, FSA"
 date: "2024-12-14"
-output: html_document
+output: 
+  html_document:
+    css: ["squareerror_markdown.css"]
+    includes:
+      in_header: "squareerror_header.html"
 ---
 
 ```{r setup, include=FALSE}
@@ -14,15 +18,19 @@ library(tidyverse)
 
 ```
 
-## Connect to the database
+## Prepare ILEC data extract
 
-I've imported the [ILEC data](https://www.soa.org/resources/research-reports/2021/2017-mortality-experience/) into my own Postgres database.  
+This notebook extracts the "Perm" (whole life) subset of data from the much larger
+[ILEC data](https://www.soa.org/resources/research-reports/2021/2017-mortality-experience/) data.  I've imported the data into a Postgres database to make it more managable.
 
-* An alternative is to download the CSV from the ILEC page, and import the CSV into DuckDB. The only thing that would change is the `DBI::dbConnect` statement, as the R code is independent of the underlying database.
+* An alternative is to download the CSV from the ILEC page, and import the CSV into DuckDB. The only thing that would change is the `DBI::dbConnect` statement, as the rest of the R code is independent of the underlying database.
 
-```{r}
+```{r warning=F}
 
 if (!exists("conn")) {
+  
+  # the database is running on a local (non-exposed) virtual network via Docker,
+  # please excuse the plaintext password stored in GitHub 
   conn <- DBI::dbConnect(dbDriver("PostgreSQL"), 
                          dbname = "postgres", 
                          host="postgis", 
@@ -55,11 +63,20 @@ tbl_ilec <- tbl(conn, "ilec_2009_2018") %>%
     insurance_plan == "PERM",
     smoker_status != "UNKNOWN")
 
-head(tbl_ilec)
+head(tbl_ilec) 
 
 ```
 
 ## Append ultimate mortality
+
+Most life insurance has a *select* period following underwriting. Mortality is 
+better during this period, since underwriting has filtered out the worst risks.
+The risk filtering effects diminish as the time since underwriting increases, and 
+when it is fully diminished, mortality from the *ultimate* table is used.
+
+This exercise uses an ultimate table mortality as an "offset" term, which relieves
+the model from having to estimate age and sex specific effects, and instead allows
+it to focus more on insurance attributes of interest (underwriting class, time since underwriting, etc.).
 
 ```{r}
 
@@ -80,23 +97,27 @@ tbl_ilec.qx <- tbl_ilec %>%
 
 ```
 
-```{r}
+### Sanity checks for the data extract
+
+```{r warning=F}
 
 tbl_ilec %>%
   summarise(
     cnt_claims = sum(number_of_deaths)
-  )
+  ) %>%
+  knitr::kable()
 
 ```
 
 
-```{r}
+```{r warning=F}
 
 tbl_ilec.qx %>%
   filter(!is.na(qx)) %>%
   summarise(
     cnt_claims = sum(number_of_deaths)
-  )
+  ) %>%
+  knitr::kable()
 
 ```
 
