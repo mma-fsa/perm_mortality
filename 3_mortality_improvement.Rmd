@@ -5,7 +5,59 @@ date: "2025-01-01"
 output: html_document
 ---
 
+```{r setup, include=FALSE}
+
+library(glmnet)
+library(xgboost)
+library(recipes)
+library(rpart)
+library(rpart.plot)
+library(splines)
+library(tidyverse)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
 ## Mortality Improvement
+
+### Background
+
+This [SOA Paper](https://www.soa.org/globalassets/assets/files/resources/essays-monographs/2017-living-to-100/2017-living-100-monograph-hunt-villegas-paper.pdf) provides a comprehensive overview of Poisson mortality improvement models.
+
+### Definitions
+
+* The instantaneous *mortality rate*, also known as the *force of mortality*, for age $x$ at time $t$
+
+$$ \mu_{x,t}$$
+
+The *central rate of mortality* for age $x$ at time $t$, is defined as the number of deaths $d_x$ over the number of person-years $L_x$ (exposures), actuaries might incorrectly refer to this quantity as $q_{x,t}$, however there are subtle differences. 
+
+$$ m_{x,t} = \frac{d_x}{L_x} = \exp(\pmb{X}\beta)$$
+
+The **crude estimate of death** given the central exposure $e_x$ is given as 
+
+$$ \hat{m_x} = \frac{d_x}{e_x}$$
+
+The **probability of death over one year** is defined as $q_x$, which under the uniform distribution of deaths is defined as 
+
+$$ q_x = \frac{m_x}{1 + 0.5 \times m_x}$$
+
+The **Poisson log-bilinear model** is defined as below.  $\alpha_x$ is the age specific mortality rate, $\beta_t$ is the time / trend improvement, and $\gamma_x \times \kappa_t$ is the interaction between the two. 
+
+$$ \ln(\mu_{x, t}) = \alpha_x + \beta_t + \gamma_x \times \kappa_t$$
+
+## Load Data
+
+```{r}
+
+ilec_perm <- bind_rows(
+  
+)
+
+```
+
 
 ### Non-smokers
 

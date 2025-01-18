@@ -39,7 +39,7 @@ These differences lead us to three distinct models:
  
 ## Training and Testing Splits
 
-Unfortunately, the ILEC data is aggregated in such a way that makes a typical train / test split cumbersome While we could sample the exposures and deaths for each aggregated cell, things like fractional exposures and the actuarial custom of setting deaths to have a full year of exposure introduce some opportunities for noise.  
+Unfortunately, the ILEC data is aggregated in such a way that makes a typical train / test split cumbersome. While we could sample the exposures and deaths for each aggregated cell, things like fractional exposures and the actuarial custom of setting deaths to have a full year of exposure introduce some opportunities for noise.  
 
 Instead, we'll use the most recent two years of data for testing, and perform cross-validation within the training set by observation year.  This is more closely aligned with what an "unseen observation" is in practice, i.e., another calendar year of data.  
 
@@ -525,6 +525,7 @@ ggplot(plot_data %>% pivot_longer(cols=-c(attained_age, face_amount_band_group))
   )
 
 ```
+
 ```{r}
 
 ggplot(plot_data, aes(x=attained_age, y=log(number_of_deaths/pred))) +
@@ -612,6 +613,7 @@ ggplot(plot_data %>% pivot_longer(cols=-c(attained_age, face_amount_band_group))
 
 
 ```
+
 ```{r}
 
 ggplot(plot_data, aes(x=attained_age, y=log(number_of_deaths/pred))) +
@@ -625,6 +627,7 @@ ggplot(plot_data, aes(x=attained_age, y=log(number_of_deaths/pred))) +
 
 
 ```
+
 ```{r}
 
 # the poor mortality experience at low face amounts is increasing in more recent
@@ -727,6 +730,35 @@ rpart.plot(rpart_model, digits=3)
 
 df_ph_data %>%
   write_rds("/mnt/data/ilec/ilec_perm_historical.rds", compress="gz")
+
+```
+
+## Check for observation year biases
+
+```{r}
+
+rpart_data <- bind_cols(
+  glmnet_ph_data.train$df,
+  tibble(pred = glmnet_ph_data.train$pred)) %>%
+  filter(attained_age >= 40)
+
+
+model_errors <- as.matrix(rpart_data[,c("pred","number_of_deaths")])
+
+rpart_model <- rpart(
+  model_errors ~ observation_year + attained_age + gender,
+  data=rpart_data,
+  method="poisson",
+  control = rpart.control(cp=0.00001, maxdepth = 3))
+
+rpart.plot(rpart_model, digits=3)
+
+```
+
+```{r}
+
+library(lme4)
+
 
 ```
 
