@@ -14,6 +14,8 @@ library(rpart)
 library(rpart.plot)
 library(splines)
 library(tidyverse)
+library(GA)
+library(memoise)
 
 knitr::opts_chunk$set(echo = TRUE)
 
@@ -53,8 +55,178 @@ $$ \ln(\mu_{x, t}) = \alpha_x + \beta_t + \gamma_x \times \kappa_t$$
 ```{r}
 
 ilec_perm <- bind_rows(
+  read_rds("ilec_perm_historical.rds"),
+  read_rds("ilec_perm_recent.rds"),
+  read_rds("ilec_simplified_issue.rds")) %>% 
+  filter(
+    attained_age <= 100
+  )
+
+head(ilec_perm)
+
+```
+
+```{r}
+
+ilec_perm %>%
+  select(attained_age, duration, observation_year) %>%
+  summary()
+
+```
+
+```{r}
+colnames(ilec_perm)
+```
+
+
+```{r}
+
+model_data <- ilec_perm %>%
+  group_by(attained_age, duration, observation_year) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    policies_exposed = sum(policies_exposed),
+    expected_deaths_08_vbt_ult = sum(expected_deaths_08_vbt_ult),
+    .groups="drop"
+  ) %>%
+  ungroup()
+
+```
+
+
+```{r}
+
+approx_ecdf <- function(df, grp_col) {
   
+  ptile_tbl <- ilec_perm %>%
+    group_by({{grp_col}}) %>%
+    summarise(
+      tot_exposures = sum(number_of_deaths),
+      .groups = "drop"
+    ) %>%
+    arrange({{grp_col}}) %>%
+    mutate(
+      cumu_tot_expos = cumsum(tot_exposures)
+    ) %>%
+    ungroup() %>%
+    mutate(
+      pct_tot_expos = cumu_tot_expos / sum(tot_exposures)
+    )
+  
+  ptile_x_vals <- ptile_tbl %>% pull({{grp_col}})
+  
+  find_p_val_argmin <- function(p_val) {
+    p_val_diff <- abs((p_val - ptile_tbl$pct_tot_expos))
+    ptile_x_vals[which((p_val_diff == min(p_val_diff)))]
+  }
+  
+  function(ptile_cuts) {
+    vec_vals <- vapply(ptile_cuts, find_p_val_argmin, c(ptile_x_vals[1]))
+    names(vec_vals) <- ptile_cuts
+    vec_vals
+  }
+}
+
+duration_ptiles <- unique(approx_ecdf(ilec_perm, duration)(seq(0.05, 0.95, 0.1)))
+attage_ptiles <- unique(approx_ecdf(ilec_perm, attained_age)(c(0.025, seq(0.1, 0.9, 0.1), 0.975)))
+observation_year_ptiles <- unique(approx_ecdf(ilec_perm, observation_year)(seq(0.25, 0.75, by=0.25)))
+
+ATTAGE_PART = "splines::ns(attained_age, Boundary.knots = c(25, 100), knots=c(%KNOTS%))"
+OBS_YR_PART = "splines::ns(observation_year, Boundary.knots = c(2009, 2018), knots=c(%KNOTS%))"
+DUR_PART = "splines::ns(duration, Boundary.knots = c(1, 38), knots=c(%KNOTS%))"
+
+formula_template <- stringr::str_glue("number_of_deaths ~ offset(log(expected_deaths_08_vbt_ult)) + {ATTAGE_PART}*{DUR_PART} + {ATTAGE_PART}*{OBS_YR_PART}")
+
+spline_locations <- list()
+
+spline_locations[[DUR_PART]] <- duration_ptiles
+spline_locations[[ATTAGE_PART]] <- attage_ptiles
+spline_locations[[OBS_YR_PART]] <- observation_year_ptiles 
+
+```
+
+
+```{r}
+
+N_BITS <- length(duration_ptiles) + length(attage_ptiles) + length(observation_year_ptiles)
+
+bit_str_to_formula <- function(bit_string) {
+  
+  bit_str_iter <- bit_string
+  full_formula <- formula_template
+  
+  for (formula_i in 1:length(spline_locations)) {
+    
+    curr_part <- names(spline_locations)[formula_i]
+    all_knots <- spline_locations[[curr_part]]
+    curr_knot_locs <- which(bit_str_iter[1:length(all_knots)] == 1)
+    curr_knots <- all_knots[curr_knot_locs]
+    
+    curr_knot_str <- paste0(curr_knots, collapse=",")
+    curr_formula <- stringr::str_replace(curr_part, "%KNOTS%", curr_knot_str)
+    full_formula <- stringr::str_replace_all(full_formula, fixed(curr_part), curr_formula)
+    
+    # shift bit string
+    bit_str_iter <- bit_str_iter[-(1:length(all_knots))]
+  }
+  
+  as.formula(full_formula)
+}
+
+glm_fitness <- function(bit_string) {
+  -1 * AIC(
+    glm(bit_str_to_formula(bit_string), family = poisson(), data = model_data)
+  )
+}
+
+
+# https://cran.r-project.org/web/packages/GA/vignettes/GA.html#memoization
+best_model <- GA::ga(type="binary", 
+       memoise::memoise(glm_fitness), 
+       popSize=40, 
+       nBits = N_BITS, 
+       maxiter = 50, 
+       parallel = F,
+       pmutation = 0.7,
+       suggestions = rbind(
+         rep(0, N_BITS),
+         rep(1, N_BITS)
+       ),
+       pcrossover=0.2)
+
+bit_str_to_formula(best_model@solution)
+
+```
+
+```{r}
+
+# 128,345.0
+
+final_formula <- number_of_deaths ~ offset(log(expected_deaths_08_vbt_ult)) + 
+    splines::ns(attained_age, Boundary.knots = c(25, 100), knots = c(45, 
+        58, 66, 71, 90, 94)) * splines::ns(duration, Boundary.knots = c(1, 
+        38), knots = c(10, 17, 20, 27, 33)) + splines::ns(attained_age, 
+    Boundary.knots = c(25, 100), knots = c(45, 58, 66, 71, 90, 
+        94)) * splines::ns(observation_year, Boundary.knots = c(2009, 
+    2018), knots = c(2014))
+
+final_fit <- glm(final_formula, family = poisson(), data = model_data)
+
+AIC(final_fit)
+
+final_fit.summary <- summary(final_fit)
+
+(final_fit.summary$null.deviance - final_fit.summary$deviance) / final_fit.summary$null.deviance
+
+```
+
+```{r}
+
+coef_groups <- tibble(
+  coef_name = names(coef(final_fit))
 )
+
+
 
 ```
 
