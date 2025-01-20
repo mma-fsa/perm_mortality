@@ -28,27 +28,36 @@ knitr::opts_chunk$set(echo = TRUE)
 
 This [SOA Paper](https://www.soa.org/globalassets/assets/files/resources/essays-monographs/2017-living-to-100/2017-living-100-monograph-hunt-villegas-paper.pdf) provides a comprehensive overview of Poisson mortality improvement models.
 
-### Definitions
+The [Stochastic Mortality Modeling](https://cran.r-project.org/web/packages/StMoMo/vignettes/StMoMoVignette.pdf) package vignette provides a lot of additional background.
 
-* The instantaneous *mortality rate*, also known as the *force of mortality*, for age $x$ at time $t$
+The approach taken here is very simple due to the relatively few observation years (10) contained in the data.  Consequently, we can only estimate the improvement over a 10 year period string in 2009.  The conceptual form of the model we'll use resembles the Poisson log-bilinear model:
 
-$$ \mu_{x,t}$$
+$$ \ln \big[ \mu_{x,t} \big] = \pmb{X} \beta = \alpha_{x} + \gamma_t + \alpha_x \gamma_t $$
 
-The *central rate of mortality* for age $x$ at time $t$, is defined as the number of deaths $d_x$ over the number of person-years $L_x$ (exposures), actuaries might incorrectly refer to this quantity as $q_{x,t}$, however there are subtle differences. 
+Where
 
-$$ m_{x,t} = \frac{d_x}{L_x} = \exp(\pmb{X}\beta)$$
+ * $\alpha_x$ is the base mortality adjustment at age $x$
+ 
+ * $\gamma_t$ is the all age mortality improvement rate at time $t$
+ 
+ * $\alpha_x \gamma_t$ is the interaction effect (age-specific improvement) 
 
-The **crude estimate of death** given the central exposure $e_x$ is given as 
+### Splines and knot selection
 
-$$ \hat{m_x} = \frac{d_x}{e_x}$$
+The above model form is overly simplistic if taken at face value.  Purely linear
+terms, like $a_x$ are a poor fit for real mortality data. A *spline* is often used
+to allow appropriate bends and wiggles in the shape of the line / curve for $a_x$.
 
-The **probability of death over one year** is defined as $q_x$, which under the uniform distribution of deaths is defined as 
+Splines have parameters called *knots* that determine where additional "wiggliness"
+is allowed in curves fit with GLMs. Adding knots increases the degrees of freedom
+of the model, so having too many can lead to overfit or (worse) convergence issues
+for the GLM fitting algorithm due to nearly-singular columns in the model matrix.
 
-$$ q_x = \frac{m_x}{1 + 0.5 \times m_x}$$
-
-The **Poisson log-bilinear model** is defined as below.  $\alpha_x$ is the age specific mortality rate, $\beta_t$ is the time / trend improvement, and $\gamma_x \times \kappa_t$ is the interaction between the two. 
-
-$$ \ln(\mu_{x, t}) = \alpha_x + \beta_t + \gamma_x \times \kappa_t$$
+One approach to determining the right number of knots, and their location, is 
+to use a *Genetic Algorithm*. Typically, knot placement are guessed then checked with
+AIC / BIC or visual plots. Using a Genetic Algorithm speeds up the guessing and
+checking process by getting us close to an optimal AIC/BIC automatically. This
+approach is used below.
 
 ## Load Data
 
@@ -62,22 +71,13 @@ ilec_perm <- bind_rows(
     attained_age <= 100
   )
 
-head(ilec_perm)
-
-```
-
-```{r}
-
 ilec_perm %>%
   select(attained_age, duration, observation_year) %>%
   summary()
 
 ```
 
-```{r}
-colnames(ilec_perm)
-```
-
+### Create model data
 
 ```{r}
 
@@ -89,16 +89,20 @@ model_data <- ilec_perm %>%
     expected_deaths_08_vbt_ult = sum(expected_deaths_08_vbt_ult),
     .groups="drop"
   ) %>%
-  ungroup()
+  ungroup() %>%
+  mutate(
+    observation_time = observation_year - min(observation_year) + 1
+  )
 
 ```
 
+### Setup the Genetic Algorithm Hypothesis Space
 
 ```{r}
 
 approx_ecdf <- function(df, grp_col) {
   
-  ptile_tbl <- ilec_perm %>%
+  ptile_tbl <- df %>%
     group_by({{grp_col}}) %>%
     summarise(
       tot_exposures = sum(number_of_deaths),
@@ -127,12 +131,12 @@ approx_ecdf <- function(df, grp_col) {
   }
 }
 
-duration_ptiles <- unique(approx_ecdf(ilec_perm, duration)(seq(0.05, 0.95, 0.1)))
-attage_ptiles <- unique(approx_ecdf(ilec_perm, attained_age)(c(0.025, seq(0.1, 0.9, 0.1), 0.975)))
-observation_year_ptiles <- unique(approx_ecdf(ilec_perm, observation_year)(seq(0.25, 0.75, by=0.25)))
+duration_ptiles <- unique(approx_ecdf(model_data, duration)(seq(0.05, 0.95, 0.1)))
+attage_ptiles <- unique(approx_ecdf(model_data, attained_age)(c(0.025, seq(0.1, 0.9, 0.1), 0.975)))
+observation_time_ptiles <- unique(approx_ecdf(model_data, observation_time)(seq(0.25, 0.75, by=0.25)))
 
 ATTAGE_PART = "splines::ns(attained_age, Boundary.knots = c(25, 100), knots=c(%KNOTS%))"
-OBS_YR_PART = "splines::ns(observation_year, Boundary.knots = c(2009, 2018), knots=c(%KNOTS%))"
+OBS_YR_PART = "splines::ns(observation_time, Boundary.knots = c(1, 10), knots=c(%KNOTS%))"
 DUR_PART = "splines::ns(duration, Boundary.knots = c(1, 38), knots=c(%KNOTS%))"
 
 formula_template <- stringr::str_glue("number_of_deaths ~ offset(log(expected_deaths_08_vbt_ult)) + {ATTAGE_PART}*{DUR_PART} + {ATTAGE_PART}*{OBS_YR_PART}")
@@ -141,10 +145,13 @@ spline_locations <- list()
 
 spline_locations[[DUR_PART]] <- duration_ptiles
 spline_locations[[ATTAGE_PART]] <- attage_ptiles
-spline_locations[[OBS_YR_PART]] <- observation_year_ptiles 
+spline_locations[[OBS_YR_PART]] <- observation_time_ptiles 
+
+formula_template
 
 ```
 
+### Run the genetic algorithm
 
 ```{r}
 
@@ -174,328 +181,181 @@ bit_str_to_formula <- function(bit_string) {
 }
 
 glm_fitness <- function(bit_string) {
-  -1 * AIC(
+  -1 * BIC(
     glm(bit_str_to_formula(bit_string), family = poisson(), data = model_data)
   )
 }
 
-
 # https://cran.r-project.org/web/packages/GA/vignettes/GA.html#memoization
 best_model <- GA::ga(type="binary", 
        memoise::memoise(glm_fitness), 
-       popSize=40, 
+       popSize=20, 
        nBits = N_BITS, 
-       maxiter = 50, 
+       maxiter = 30, 
        parallel = F,
        pmutation = 0.7,
+       elitism = 5,
        suggestions = rbind(
          rep(0, N_BITS),
          rep(1, N_BITS)
        ),
-       pcrossover=0.2)
+       pcrossover=0.7)
 
 bit_str_to_formula(best_model@solution)
 
 ```
+
+### Build model based on GA best solution
 
 ```{r}
 
 # 128,345.0
 
 final_formula <- number_of_deaths ~ offset(log(expected_deaths_08_vbt_ult)) + 
-    splines::ns(attained_age, Boundary.knots = c(25, 100), knots = c(45, 
-        58, 66, 71, 90, 94)) * splines::ns(duration, Boundary.knots = c(1, 
-        38), knots = c(10, 17, 20, 27, 33)) + splines::ns(attained_age, 
-    Boundary.knots = c(25, 100), knots = c(45, 58, 66, 71, 90, 
-        94)) * splines::ns(observation_year, Boundary.knots = c(2009, 
-    2018), knots = c(2014))
+    splines::ns(attained_age, Boundary.knots = c(25, 100), knots = c(40, 50, 55, 60, 65, 70, 90)) * 
+      splines::ns(duration, Boundary.knots = c(1, 38), knots = c(10, 17)) + 
+    splines::ns(attained_age, Boundary.knots = c(25, 100), knots = c(40, 50, 55, 60, 65, 70, 90)) * observation_time
 
-final_fit <- glm(final_formula, family = poisson(), data = model_data)
+final_fit <- glm(final_formula, 
+                 family = poisson(), 
+                 data = model_data)
 
-AIC(final_fit)
+model_data[["MODEL_PRED"]] <- predict(final_fit, newdata=model_data, type = "response")
 
-final_fit.summary <- summary(final_fit)
+list(
+  "AIC" = AIC(final_fit),
+  "BIC" = BIC(final_fit),
+  "D^2" = (final_fit.summary$null.deviance - final_fit.summary$deviance) / final_fit.summary$null.deviance,
+  "Dispersion" = final_fit.summary$deviance / final_fit.summary$df.residual
+)
 
-(final_fit.summary$null.deviance - final_fit.summary$deviance) / final_fit.summary$null.deviance
 
 ```
+
+
+
+### Check the fit
+
+```{r fig.width=10}
+
+attage_cuts <- c(0, seq(50, 80, by=10), Inf)
+
+plot_data <- model_data %>%
+  mutate(
+    attage_grp = cut(attained_age, breaks=!!attage_cuts, ordered_result = T),
+    duration = pmax(10, pmin(duration, 30))) %>%
+  group_by(attage_grp, duration) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    MODEL_PRED = sum(MODEL_PRED),
+    .groups="drop"
+  ) %>%
+  ungroup()
+
+
+ggplot(plot_data, aes(x=duration, y=log(number_of_deaths / MODEL_PRED))) +
+  facet_wrap(~ attage_grp, scales="free_y") +
+  ylab("log A/E") +
+  geom_point() +
+  geom_line() + 
+  theme_bw() +
+  geom_hline(yintercept = 0, color="red")
+
+
+```
+
+```{r}
+
+plot_data <- model_data %>%
+  mutate(
+    attage_grp = cut(attained_age, breaks=!!attage_cuts, ordered_result = T)) %>%
+  group_by(attage_grp, observation_time) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    MODEL_PRED = sum(MODEL_PRED),
+    .groups="drop"
+  ) %>%
+  ungroup()
+
+
+ggplot(plot_data, aes(x=observation_time, y=log(number_of_deaths / MODEL_PRED))) +
+  facet_wrap(~ attage_grp, scales="free_y") +
+  ylab("log A/E") +
+  geom_point() +
+  geom_line() + 
+  theme_bw() +
+  geom_hline(yintercept = 0, color="red")
+
+
+```
+
+### Convert model to a set of multiplicative factors
 
 ```{r}
 
 coef_groups <- tibble(
   coef_name = names(coef(final_fit))
-)
+) %>%
+  mutate(coef_group = case_when(
+    coef_name == "(Intercept)" ~ "Base Adjustment",
+    stringr::str_detect(coef_name, fixed("attained_age")) & 
+      stringr::str_detect(coef_name, fixed("duration")) ~ "Attained Age x Duration",
+    stringr::str_detect(coef_name, fixed("attained_age")) & 
+      stringr::str_detect(coef_name, fixed("observation_time")) ~ "Attained Age x Observation Time",
+    stringr::str_detect(coef_name, fixed("attained_age")) ~ "Attained Age",
+    stringr::str_detect(coef_name, fixed("observation_time")) ~ "Observation Time",
+    stringr::str_detect(coef_name, fixed("duration")) ~ "Duration"
+  )) 
 
-
+any(is.na(coef_groups$coef_group))
 
 ```
 
-
-### Non-smokers
-
-#### Evaluate knot locations
-
-Very heavily skewed towards old age deaths, looks like first knot should be
-places around 50 (5% of the deaths), second around 65.
+### Mortality Improvement Factors
 
 ```{r}
 
-plot_data <- df_study_data %>%
-  filter(
-    smoker_status == "NONSMOKER",
-    attained_age >= 25,
-    attained_age <= 90) %>%
-  group_by(attained_age, gender) %>%
-  summarise(
-    n_deaths = sum(number_of_deaths)
-  ) %>%
-  ungroup() %>%
-  group_by(gender) %>%
-  arrange(attained_age) %>%
-  mutate(
-    cumulative_pct_of_deaths = cumsum(n_deaths) / sum(n_deaths)
-  ) 
+factor_grid <- expand.grid(
+  "attained_age" = seq(min(model_data$attained_age), max(model_data$attained_age)),
+  "duration" = median(model_data$duration),
+  "observation_time" = c(1, 2),
+  "expected_deaths_08_vbt_ult" = c(1)
+) %>%
+  mutate(row_id = row_number())
 
-ggplot(plot_data, aes(x=attained_age, y=cumulative_pct_of_deaths, group=gender, color=gender)) +
+factor_preds <- predict(final_fit, newdata=factor_grid, type = "terms")
+colnames(factor_preds) <- paste0("factor_", colnames(factor_preds))
+
+factor_grid.full <- bind_cols(
+  factor_grid,
+  factor_preds
+) 
+
+mi_factors <- factor_grid.full %>%
+  rename(factor_attage_x_obs_time = `factor_splines::ns(attained_age, Boundary.knots = c(25, 100), knots = c(40, 50, 55, 60, 65, 70, 90)):observation_time`) %>%
+  mutate(
+    factor_full_mi = exp(factor_attage_x_obs_time + factor_observation_time)) %>%
+  select(observation_time, attained_age, factor_full_mi) %>%
+  pivot_wider(
+    id_cols=c(attained_age),
+    names_from = observation_time,
+    values_from = factor_full_mi
+  ) %>%
+  mutate(
+    mi_factor = `2` / `1`
+  )
+
+ggplot(mi_factors, aes(x=attained_age, y=mi_factor)) +
+  geom_point() +
   geom_line() +
-  scale_y_continuous(
-    labels = scales::percent_format(), 
-    transform = scales::pseudo_log_trans(sigma = 0.01),
-    breaks=seq(0,1,by=0.1)) +
-  scale_x_continuous(breaks=seq(0, 120, by=10)) +
-  # eye-ball first knot location
-  geom_hline(yintercept = 0.05) +
-  geom_vline(xintercept = 50) +
-  # eye-ball second knot location
-  geom_hline(yintercept = 0.15) +
-  geom_vline(xintercept = 65) +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent_format(),
+                     trans = scales::pseudo_log_trans(sigma=0.0001)) +
+  scale_x_continuous(breaks = seq(25, 95, by=10)) +
+  
+  ylab("Improvement") +
   xlab("Attained Age") +
-  ylab("Cumulative % of Deaths") +
-  theme_bw()
+  ggtitle("Annual Mortality Improvement", "Ages 45-85 showing improvement")
 
 ```
-
-### Build inferential model
-
-By accounting for the other time variables (attained age + duration), we can see
-what is left over by observation (calendar) year.  This will give us a starting 
-point for a mortality improvement assumption.  Cap the duration at 20, since 
-underwriting should largely be worn-off by that time.
-
-```{r}
-
-df_model_data <- df_study_data %>%
-  filter(smoker_status == "NONSMOKER",
-         number_of_preferred_classes != "NA",
-         attained_age >= 25,
-         attained_age <= 90) %>%
-  mutate(
-    gender = factor(gender, levels=c("MALE", "FEMALE")),
-    capped_duration = pmin(20, duration),
-    expected_claims = qx * policies_exposed,
-    face_amount_band = ordered(face_amount_band, levels=!!face_amount_order),
-    face_amount_band_int = as.integer(face_amount_band)
-  ) %>%
-  filter(face_amount_band_int > 2) %>%
-  group_by(observation_year, gender, attained_age, capped_duration, face_amount_band, face_amount_band_int) %>%
-  summarise(
-    number_of_deaths = sum(number_of_deaths),
-    expected_claims = sum(expected_claims),
-    .groups="drop") %>%
-  ungroup() %>%
-  filter(expected_claims > 0)
-
-X_mat <- model.matrix(
-  number_of_deaths ~ gender * 
-    splines::ns(attained_age, Boundary.knots = c(25, 90), knots = c(35, 45, 55, 65, 75, 85)) *
-    splines::ns(capped_duration, Boundary.knots=c(1, 20), knots = c(5, 10, 15)) - 1,
-  data=df_model_data
-)
-
-X_offset <- log(df_model_data$expected_claims)
-
-y_mat <- df_model_data$number_of_deaths
-
-```
-
-#### Run CV
-
-Select the lambda for the lasso based on a rudimentary CV.
-
-```{r}
-
-cv_model <- cv.glmnet(
-  X_mat,
-  y_mat,
-  family="poisson",
-  offset=X_offset,
-  fit_intercept=T
-)
-
-cv_model
-
-```
-
-#### Build Model
-
-Fit the model and plot the lambda selected via CV
-
-```{r}
-
-glmnet_model <- glmnet::glmnet(
-  X_mat,
-  y_mat,
-  family="poisson",
-  offset=X_offset,
-  fit_intercept=T
-)
-
-lambda_diff <- abs(glmnet_model$lambda - cv_model$lambda.1se)
-
-LAMBDA_INDEX <- which(lambda_diff == min(lambda_diff))
-
-best_lambda_value <- glmnet_model$lambda[LAMBDA_INDEX]
-
-plot(glmnet_model$dev.ratio, type="l")
-points(LAMBDA_INDEX, glmnet_model$dev.ratio[LAMBDA_INDEX])
-
-```
-
-
-#### Check Model
-
-```{r}
-
-model_pred <- predict(
-  glmnet_model,
-  newx=X_mat,
-  newoffset = X_offset,
-  s=best_lambda_value,
-  type = "response")
-
-df_model_data$model_pred <- model_pred
-
-# sanity check
-sum(df_model_data$number_of_deaths) / sum(model_pred)
-
-```
-
-#### Look for any major areas of poor fit
-
-Use a decision tree to evaluate the model fit / residuals on the training set.
-
-* Early durations don't look great, but there aren't a lot of deaths
-
-```{r}
-
-model_errors <- as.matrix(df_model_data[,c("model_pred","number_of_deaths")])
-
-rpart_model <- rpart(
-  model_errors ~ capped_duration + attained_age + gender,
-  data=df_model_data,
-  method="poisson",
-  control = rpart.control(cp=0.001, maxdepth = 3))
-
-rpart.plot(rpart_model, digits=3)
-
-```
-
-#### Check Mortality Improvement
-
-Downward sloping lines mean that mortality is getting better over time, this
-is called *mortality improvement*.  It's generally attributed to changes in lifestyle (fewer smokers),
-and medical advances (statins, better cancer treatment, etc.).
-
-* Evidence of improvement between 55 and 75
-
-* The upward sloping lines at earlier ages is consistent with *deaths of despair* that occured following the 2008 recession, where mortality worsened for younger ages.
-
-
-```{r}
-
-age_cuts <- c(-Inf, seq(35, 85, by=10), Inf)
-
-plot_data <- df_model_data %>%
-  filter(observation_year < 2018) %>%
-  mutate(
-    age_group = cut(attained_age, breaks=!!age_cuts)
-  ) %>%
-  group_by(age_group, gender, observation_year) %>%
-  summarise(
-    number_of_deaths = sum(number_of_deaths),
-    model_pred = sum(model_pred),
-    .groups="drop"
-  ) %>%
-  ungroup()
-
-ggplot(plot_data, aes(x=observation_year, y=log(number_of_deaths/model_pred), color=gender, group=gender)) +
-  facet_wrap(~ age_group, scales="free_y") +
-  geom_line() +
-  geom_smooth(method="lm", se=F) +
-  ggtitle("Mortality Improvement Check") +
-  theme_bw() +
-  xlab("Observation Year") +
-  ylab("Log A/E")
-
-```
-
-No improvement in 75-85, regardless of the face amounts
-
-```{r}
-
-plot_data <- df_model_data %>%
-  filter(observation_year < 2018) %>%
-  mutate(
-    age_group = cut(attained_age, breaks=!!age_cuts)
-  ) %>%
-  filter(age_group == "(75,85]") %>%
-  group_by(face_amount_band, gender, observation_year) %>%
-  summarise(
-    number_of_deaths = sum(number_of_deaths),
-    model_pred = sum(model_pred),
-    .groups="drop"
-  ) %>%
-  ungroup()
-
-ggplot(plot_data, aes(x=observation_year, y=log(number_of_deaths/model_pred), color=gender, group=gender)) +
-  facet_wrap(~ face_amount_band, scales="free_y") +
-  geom_line() +
-  geom_smooth(method="lm", se=F) +
-  ggtitle("Mortality Improvement Check - 75 to 84") +
-  theme_bw() +
-  xlab("Observation Year") +
-  ylab("Log A/E")
-
-```
-
-No strong evidence of improvement at 85+
-
-```{r}
-
-plot_data <- df_model_data %>%
-  filter(observation_year < 2018) %>%
-  mutate(
-    age_group = cut(attained_age, breaks=!!age_cuts)
-  ) %>%
-  filter(age_group == "(85, Inf]") %>%
-  group_by(face_amount_band, gender, observation_year) %>%
-  summarise(
-    number_of_deaths = sum(number_of_deaths),
-    model_pred = sum(model_pred),
-    .groups="drop"
-  ) %>%
-  ungroup()
-
-ggplot(plot_data, aes(x=observation_year, y=log(number_of_deaths/model_pred), color=gender, group=gender)) +
-  facet_wrap(~ face_amount_band, scales="free_y") +
-  geom_line() +
-  geom_smooth(method="lm", se=F) +
-  ggtitle("Mortality Improvement Check - 85+") +
-  theme_bw() +
-  xlab("Observation Year") +
-  ylab("Log A/E")
-
-```
-
-
 
