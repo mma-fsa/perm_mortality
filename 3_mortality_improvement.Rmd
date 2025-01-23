@@ -100,40 +100,11 @@ model_data <- ilec_perm %>%
 
 ```{r}
 
-approx_ecdf <- function(df, grp_col) {
-  
-  ptile_tbl <- df %>%
-    group_by({{grp_col}}) %>%
-    summarise(
-      tot_exposures = sum(number_of_deaths),
-      .groups = "drop"
-    ) %>%
-    arrange({{grp_col}}) %>%
-    mutate(
-      cumu_tot_expos = cumsum(tot_exposures)
-    ) %>%
-    ungroup() %>%
-    mutate(
-      pct_tot_expos = cumu_tot_expos / sum(tot_exposures)
-    )
-  
-  ptile_x_vals <- ptile_tbl %>% pull({{grp_col}})
-  
-  find_p_val_argmin <- function(p_val) {
-    p_val_diff <- abs((p_val - ptile_tbl$pct_tot_expos))
-    ptile_x_vals[which((p_val_diff == min(p_val_diff)))]
-  }
-  
-  function(ptile_cuts) {
-    vec_vals <- vapply(ptile_cuts, find_p_val_argmin, c(ptile_x_vals[1]))
-    names(vec_vals) <- ptile_cuts
-    vec_vals
-  }
-}
+source("0_lib.R")
 
-duration_ptiles <- unique(approx_ecdf(model_data, duration)(seq(0.05, 0.95, 0.1)))
-attage_ptiles <- unique(approx_ecdf(model_data, attained_age)(c(0.025, seq(0.1, 0.9, 0.1), 0.975)))
-observation_time_ptiles <- unique(approx_ecdf(model_data, observation_time)(seq(0.25, 0.75, by=0.25)))
+duration_ptiles <- unique(approx_ecdf(model_data, duration, number_of_deaths)(seq(0.05, 0.95, 0.1)))
+attage_ptiles <- unique(approx_ecdf(model_data, attained_age, number_of_deaths)(c(0.025, seq(0.1, 0.9, 0.1), 0.975)))
+observation_time_ptiles <- unique(approx_ecdf(model_data, observation_time, number_of_deaths)(seq(0.25, 0.75, by=0.25)))
 
 ATTAGE_PART = "splines::ns(attained_age, Boundary.knots = c(25, 100), knots=c(%KNOTS%))"
 OBS_YR_PART = "splines::ns(observation_time, Boundary.knots = c(1, 10), knots=c(%KNOTS%))"
@@ -157,28 +128,7 @@ formula_template
 
 N_BITS <- length(duration_ptiles) + length(attage_ptiles) + length(observation_year_ptiles)
 
-bit_str_to_formula <- function(bit_string) {
-  
-  bit_str_iter <- bit_string
-  full_formula <- formula_template
-  
-  for (formula_i in 1:length(spline_locations)) {
-    
-    curr_part <- names(spline_locations)[formula_i]
-    all_knots <- spline_locations[[curr_part]]
-    curr_knot_locs <- which(bit_str_iter[1:length(all_knots)] == 1)
-    curr_knots <- all_knots[curr_knot_locs]
-    
-    curr_knot_str <- paste0(curr_knots, collapse=",")
-    curr_formula <- stringr::str_replace(curr_part, "%KNOTS%", curr_knot_str)
-    full_formula <- stringr::str_replace_all(full_formula, fixed(curr_part), curr_formula)
-    
-    # shift bit string
-    bit_str_iter <- bit_str_iter[-(1:length(all_knots))]
-  }
-  
-  as.formula(full_formula)
-}
+bit_str_to_formula <- make_bit_str_to_formula(formula_template, spline_locations)
 
 glm_fitness <- function(bit_string) {
   -1 * BIC(
