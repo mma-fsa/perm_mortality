@@ -458,13 +458,14 @@ bit_str_to_formula(best_model@solution)
 
 ```{r}
 
-DURATION_INTERP_START <- 12
+DURATION_INTERP_START <- 10
 DURATION_INTERP_END <- 15
+DURATION_INTERP_POWER <- 0.33
 
 prep_log_interp <- function(df) {
   df %>%
     mutate(
-      c1 = pmin(1, pmax(0, DURATION_INTERP_END - duration) / (DURATION_INTERP_END - DURATION_INTERP_START))^(1/2),
+      c1 = pmin(1, pmax(0, DURATION_INTERP_END - duration) / (DURATION_INTERP_END - DURATION_INTERP_START))^DURATION_INTERP_POWER,
       c2 = 1 - c1,
       log_duration_interp = c1 * log(duration) + c2 * log(DURATION_INTERP_END)
     ) %>%
@@ -508,7 +509,8 @@ final_model <- glmnet::glmnet(
   )
   
 aic_bic <- calc_aic_bic_glmnet(final_model)
-aic_bic
+
+min(aic_bic$BIC)
 
 ```
 
