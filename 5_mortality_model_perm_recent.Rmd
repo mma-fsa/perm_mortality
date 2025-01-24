@@ -587,8 +587,7 @@ rpart_model <- rpart(
   method="poisson",
   control = rpart.control(cp=0.0001, maxdepth = 3))
 
-rpart.plot(rpart_model, digits=3)
-
+rpart.plot(rpart_model, digits=4)
 ```
 
 ```{r fig.width=10}
