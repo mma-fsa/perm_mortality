@@ -742,7 +742,6 @@ rpart_data <- bind_cols(
   tibble(pred = glmnet_ph_data.train$pred)) %>%
   filter(attained_age >= 40)
 
-
 model_errors <- as.matrix(rpart_data[,c("pred","number_of_deaths")])
 
 rpart_model <- rpart(
@@ -754,12 +753,4 @@ rpart_model <- rpart(
 rpart.plot(rpart_model, digits=3)
 
 ```
-
-```{r}
-
-library(lme4)
-
-
-```
-
 

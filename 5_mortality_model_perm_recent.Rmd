@@ -473,6 +473,7 @@ prep_log_interp <- function(df) {
 }
 
 model_data.train <- model_data.train %>% prep_log_interp()
+model_data.test <-  model_data.test %>% prep_log_interp()
 
 best_formula <- number_of_deaths ~ 
     preferred_class + 
@@ -515,12 +516,107 @@ min(aic_bic$BIC)
 ```
 
 
+### Plot Deviance Ratio vs. Lambda
 
 ```{r}
 
+BEST_LAMBDA_IDX <- 35
+
+best_lambda_val <- final_model$lambda[BEST_LAMBDA_IDX]
+plot(final_model$dev.ratio, type="l")
+points(BEST_LAMBDA_IDX, final_model$dev.ratio[BEST_LAMBDA_IDX])
+
+```
+
+### Append Predictions
+
+```{r}
+
+model_data.train[["pred_deaths"]] <- predict(
+  final_model, 
+  newx = model.matrix(best_formula, data=model_data.train),
+  s = best_lambda_val,
+  type="response",
+  newoffset = log(model_data.train$expected_deaths_08_vbt_ult)) %>%
+  c()
+
+model_data.test[["pred_deaths"]] <- predict(
+  final_model, 
+  newx = model.matrix(best_formula, data=model_data.test),
+  s = best_lambda_val,
+  type="response",
+  newoffset = log(model_data.test$expected_deaths_08_vbt_ult)) %>%
+  c()
+
+list(
+  "train A/E" = sum(model_data.train$number_of_deaths) / sum(model_data.train$pred_deaths),
+  "test A/E" = sum(model_data.test$number_of_deaths) / sum(model_data.test$pred_deaths)
+)
+
+
+```
+
+### Check Model w/ Decision Tree
+
+```{r fig.width=10}
+
+prep_rpart_data <- function(df) {
+  X <- df %>% 
+    select(-number_of_deaths, 
+           -expected_deaths_08_vbt_ult, 
+           -log_duration_interp,
+           -pred_deaths)
+  
+  y <- df[, c("pred_deaths", "number_of_deaths")] %>%
+    as.matrix()
+  
+  list(
+    "X" = X,
+    "y" = y
+  )
+}
+
+rpart_data <- model_data.train %>%
+  prep_rpart_data
+
+model_errors <- rpart_data$y
+
+rpart_model <- rpart(
+  model_errors ~ .,
+  data=rpart_data$X,
+  method="poisson",
+  control = rpart.control(cp=0.0001, maxdepth = 3))
+
+rpart.plot(rpart_model, digits=3)
+
+```
+
+```{r fig.width=10}
+
+rpart_data <- model_data.test %>%
+  prep_rpart_data()
+
+model_errors <- rpart_data$y
+
+rpart_model <- rpart(
+  model_errors ~ .,
+  data=rpart_data$X,
+  method="poisson",
+  control = rpart.control(cp=0.0001, maxdepth = 3))
+
+rpart.plot(rpart_model, digits=3)
+
+
+```
+
+
+
+### Examine model factors
+
+```{r}
 
 best_coefs <- predict.glmnet(
-  final_model, newx=X_mat, s=final_model$lambda[60], type = "coefficients"
+  final_model, newx=X_mat, s=best_lambda_val, type = "coefficients"
 )
 
 predictor_groups <- tibble(
@@ -570,7 +666,6 @@ X_pred_grid <- cbind(
   rep(1, nrow(pred_grid)),
   model.matrix(best_formula, data=pred_grid)
 )
-  
 
 coeff_diag <- rep(0, best_coefs@Dim[1])
 coeff_diag[best_coefs@i + 1] <- best_coefs@x
@@ -613,6 +708,14 @@ plot_data <- full_pred_df %>%
 
 ggplot(plot_data, aes(x=duration, y=factor_issue_age_x_duration, group=issue_age, color=issue_age)) +
   geom_line()
+
+```
+
+### Evaluate Model
+
+```{r}
+
+colnames(model_data.train)
 
 ```
 
