@@ -552,7 +552,7 @@ model_data.test <- df_ph_data.test %>% group_model_data()
 
 interp_spline <- function(v, interp_start, interp_end, interp_power) {
   c1 <- pmin(1, pmax(0, interp_end - v) / (interp_end - interp_start))^interp_power
-  c1 * v + (1-c1) * v
+  c1 * log(v) + (1-c1) * log(interp_end)
 }
 
 issue_age_groups <- list(
@@ -608,15 +608,16 @@ if (!(as.integer(N_BITS) == N_BITS)) {
 
 bit_str_iter <- as.integer(round(runif(N_BITS,0, 1), 0))
 
-ga_formula <- number_of_deaths ~ 
+ga_formula <- number_of_deaths ~ -1 +
     preferred_class + 
     gender * 
       splines::ns(attained_age, Boundary.knots = c(25, 95), knots = c(35, 45, 52, 70)) +
     splines::bs(face_amount_band_int, degree = 1, Boundary.knots = c(1, 11), knots = c(2, 7)) + 
-  AGE_GRPS_NS +
-  ns_ind*(AGE_GRPS_NS * log_interp_spline_ns) +
-  AGE_GRPS_SM +
-  sm_ind*(AGE_GRPS_SM * log_interp_spline_sm)
+  sm_ind +
+  ns_ind:AGE_GRPS_NS +
+  ns_ind:AGE_GRPS_NS:log_interp_spline_ns +
+  sm_ind:AGE_GRPS_SM +
+  sm_ind:AGE_GRPS_SM:log_interp_spline_sm 
 
 ga_params <- list()
 
@@ -655,13 +656,13 @@ bit_str_to_mm <- function(bit_str, model_data) {
     mutate(
       sm_ind = ifelse(smoker_status == "SMOKER", 1, 0),
       ns_ind = 1 - sm_ind,
-      AGE_GRPS_NS = cut(attained_age, breaks = curr_ns_breaks),
-      AGE_GRPS_SM = cut(attained_age, breaks = curr_sm_breaks),
-      log_interp_spline_ns = interp_spline(log(duration), 
+      AGE_GRPS_NS = cut(issue_age, breaks = curr_ns_breaks),
+      AGE_GRPS_SM = cut(issue_age, breaks = curr_sm_breaks),
+      log_interp_spline_ns = interp_spline(duration, 
                                            !!ns_spline_params[1],
                                            !!ns_spline_params[2],
                                            !!ns_spline_params[3]),
-      log_interp_spline_sm = interp_spline(log(duration), 
+      log_interp_spline_sm = interp_spline(duration, 
                                            !!sm_spline_params[1],
                                            !!sm_spline_params[2],
                                            !!sm_spline_params[3]))
@@ -725,22 +726,26 @@ ga_fitness_2 <- function(bit_string) {
   fitness_val
 }
 
-
 memo_fn_fitness <- memoise::memoise(ga_fitness_2)
 
 best_model <- GA::ga(type="binary", 
        memo_fn_fitness, 
        popSize=20, 
-       crossover = GA::gabin_uCrossover,
        nBits = N_BITS, 
        maxiter = 5, 
        parallel = F,
        pmutation = 0.2,
-       elitism = 1,
+       elitism = 4,
        pcrossover=0.7)
 
-bit_str_to_mm(best_model@solution[1, ], model_data.train)$ga_params
+best_model@solution
 
+```
+
+```{r}
+final_ga_bit_str <- best_model@solution[1, ]
+
+bit_str_to_mm(final_ga_bit_str, model_data.train)$ga_params
 
 ```
 
@@ -749,9 +754,10 @@ bit_str_to_mm(best_model@solution[1, ], model_data.train)$ga_params
 
 ```{r}
 
-best_mm <- bit_str_to_mm(best_model@solution[1, ], model_data.train)
+best_mm <- bit_str_to_mm(final_ga_bit_str, model_data.train)
 
-print("fitting...")
+colSums(best_mm$model.matrix)
+
 best_fit <- glmnet::glmnet(
   best_mm$model.matrix,
   model_data.train$number_of_deaths,
@@ -773,7 +779,7 @@ aic_bic <- calc_aic_bic_glmnet(best_fit)
 
 ```{r}
 
-BEST_LAMBDA_IDX <- 50
+BEST_LAMBDA_IDX <- 100
 best_lambda_val <- best_fit$lambda[BEST_LAMBDA_IDX]
 
 best_mm.train <- bit_str_to_mm(
@@ -818,23 +824,39 @@ best_coefs <- predict.glmnet(
   best_fit, newx=X_mat, s=best_lambda_val, type = "coefficients"
 )
 
+best_coefs
+```
+
+
+```{r}
+
 predictor_groups <- tibble(
   term_name = best_coefs@Dimnames[[1]]
   ) %>%
   mutate(
     term_group = case_when(
       stringr::str_detect(term_name, fixed("Intercept")) ~ "factor_base_rate",
+      
       stringr::str_detect(term_name, fixed("preferred_class")) ~ "factor_preferred_class",
-      stringr::str_detect(term_name, fixed("smoker_status")) ~ "factor_smoker_status",
+      
       stringr::str_detect(term_name, fixed("gender")) |
         stringr::str_detect(term_name, fixed("attained_age")) ~ "factor_gender_x_attained_age",
-      stringr::str_detect(term_name, fixed("issue_age")) |
-        stringr::str_detect(term_name, fixed("duration")) ~ "factor_issue_age_x_duration",
-      stringr::str_detect(term_name, fixed("face_amount_band_int")) ~ "factor_face_amount"
+      
+      stringr::str_detect(term_name, fixed("log_interp_spline_ns")) |
+        stringr::str_detect(term_name, fixed("log_interp_spline_sm")) ~ "factor_issue_age_x_duration",
+      
+      stringr::str_detect(term_name, fixed("AGE_GRPS_NS")) |
+        stringr::str_detect(term_name, fixed("AGE_GRPS_SM")) ~ "factor_issue_age_x_uwclass",
+      
+      stringr::str_detect(term_name, fixed("face_amount_band_int")) ~ "factor_face_amount",
+      
+      stringr::str_detect(term_name, fixed("sm_ind")) |
+        stringr::str_detect(term_name, fixed("ns_ind"))  ~ "factor_issue_age_x_uwclass",
     )
   )
 
 predictor_groups %>% view()
+
 ```
 
 
@@ -858,12 +880,13 @@ pred_grid <- expand.grid(
     (
       ((number_of_preferred_classes == "2") & (preferred_class %in% c("1", "2"))) |
       ((number_of_preferred_classes == "3") & (preferred_class %in% c("1", "2", "3")))
-    )) %>%
-  prep_log_interp()
+    )) 
+
+pred_grid.mm <- bit_str_to_mm(final_ga_bit_str, pred_grid)
 
 X_pred_grid <- cbind(
   rep(1, nrow(pred_grid)),
-  model.matrix(best_formula, data=pred_grid)
+  pred_grid.mm$model.matrix
 )
 
 coeff_diag <- rep(0, best_coefs@Dim[1])
@@ -898,3 +921,34 @@ full_pred_df <- bind_cols(
 )
 
 ```
+
+
+```{r}
+
+plot_data %>% view()
+
+```
+
+
+```{r}
+
+plot_data <- full_pred_df %>%
+  select(issue_age, smoker_status, duration, factor_issue_age_x_duration, factor_issue_age_x_uwclass) %>%
+  distinct() 
+
+#plot_data %>%
+#  filter(issue_age == 18) %>% view()
+
+ggplot(plot_data, aes(x=duration, y=factor_issue_age_x_duration * factor_issue_age_x_uwclass, group=issue_age, color=issue_age)) +
+  facet_wrap(~ smoker_status) +
+  geom_line()
+
+```
+
+```{r}
+
+pred_df
+
+```
+
+
