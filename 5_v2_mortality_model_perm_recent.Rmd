@@ -1,0 +1,900 @@
+---
+title: "Perm Mortality Model"
+author: "Mike McPhee Anderson, FSA"
+date: "2024-12-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(glmnet)
+library(xgboost)
+library(recipes)
+library(rpart)
+library(rpart.plot)
+library(splines)
+library(rsample)
+library(shapviz)
+library(tidyselect)
+library(doMC)
+library(tidyverse)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# Overview
+
+## Models
+
+Within the ILEC data "Perm" (permanent) life insurance category, there
+are some major differences in the underwriting / target market that can be inferred via EDA. 
+These differences lead us to three distinct models:
+
+ 1. *Simplified Issue:* Policies issued after 2005 without any preferred classes are likely simplified
+   issue.  These policies are less than $100K face amount, and are likely to have less stringent underwriting.
+   
+ 2. *Fully Underwritten (recent):*  Post-2005 policies are likely to have at least one preferred class, and I recall that blood testing gained traction in the late 1990s.  These policies will also have some underwriting class selection (select period) that is still applicable.
+ 
+ 3. *Fully Underwritten (historical):*  Policies prior to 2005 are likely to have little remaining effects from underwriting selection.  Also, this data is unlikely to have preferred classes, and is mostly just smoker vs. non-smoker for underwriting classes.  The majority of it will be smaller face amounts.
+ 
+## Training and Testing Splits
+
+Unfortunately, the ILEC data is aggregated in such a way that makes a typical train / test split cumbersome. While we could sample the exposures and deaths for each aggregated cell, things like fractional exposures and the actuarial custom of setting deaths to have a full year of exposure introduce some opportunities for noise.  
+
+Instead, we'll use the most recent two years of data for testing, and perform cross-validation within the training set by observation year.  This is more closely aligned with what an "unseen observation" is in practice, i.e., another calendar year of data.  
+
+# Setup 
+
+## Load Data
+
+```{r}
+
+face_amount_order <- c(
+  "1-9999",
+  "10000-24999",
+  "25000-49999",
+  "50000-99999",
+  "100000-249999",
+  "250000-499999",
+  "500000-999999",
+  "1000000-2499999",
+  "2500000-4999999",
+  "5000000-9999999",
+  "10000000+"
+)
+
+df_study_data <- read_rds("ilec_perm_recent.rds") %>%
+  mutate(
+    train_test = ifelse(observation_year >= 2016, "TEST", "TRAIN"),
+      # no selection period, just ultimate mortality
+    expected_deaths_08_vbt_ult = coalesce(qx * policies_exposed),
+    # create ordered factor + integer representation of face amount bands
+    face_amount_band = ordered(face_amount_band, levels=!!face_amount_order),
+    face_amount_band_int = as.integer(face_amount_band),
+    issue_age = attained_age - duration + 1
+  ) %>%
+  filter(expected_deaths_08_vbt_ult > 0)
+
+```
+
+# Perm Historical Model
+
+## Train Test Split
+
+```{r}
+
+df_ph_data <- df_study_data 
+
+df_ph_data.train <- df_ph_data %>% 
+  filter(train_test == "TRAIN")
+
+df_ph_data.test <- df_ph_data %>%
+  filter(train_test == "TEST")
+
+df_ph_data %>%
+  group_by(train_test) %>%
+  summarise(
+    n_deaths = sum(number_of_deaths),
+    .groups="drop"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    pct_deaths = n_deaths / sum(n_deaths)
+  )
+
+```
+
+## Xgboost Model
+
+```{r}
+
+df_ph_data.train %>%
+  group_by(smoker_status, number_of_preferred_classes, preferred_class) %>%
+  summarise(
+    n_deaths = sum(number_of_deaths)
+  )
+
+```
+
+```{r}
+
+summary(df_ph_data.train)
+
+```
+
+### Knot Selection
+
+```{r}
+
+group_model_data <- function(df) {
+  df %>%
+    group_by(attained_age, duration, issue_age, number_of_preferred_classes,
+             preferred_class, smoker_status, face_amount_band_int, gender) %>%
+    summarise(
+      number_of_deaths = sum(number_of_deaths),
+      expected_deaths_08_vbt_ult = sum(expected_deaths_08_vbt_ult),
+      .groups="drop"
+    ) %>%
+    ungroup()
+}
+
+model_data.train <- df_ph_data.train %>% group_model_data()
+model_data.test <- df_ph_data.test %>% group_model_data()
+
+# ph.glmnet.recipe <- recipe(number_of_deaths ~ face_amount_band_int + 
+#                              attained_age + 
+#                              duration + 
+#                              issue_age +
+#                              gender +
+#                              number_of_preferred_classes +
+#                              preferred_class +
+#                              smoker_status,
+#                            data = model_data.train) %>%
+#   step_my_model_factor_prep() %>%
+#   prep(model_data.train, retain=F)
+# 
+# bake(ph.glmnet.recipe, model_data.train) %>%
+#   summary()
+
+```
+
+
+```{r}
+
+# source("0_lib.R")
+# 
+# knot_loc_ptiles <- seq(0.05, 0.95, by=0.1)
+# 
+# attage_ecdf <- model_data.train %>%
+#   approx_ecdf(attained_age, number_of_deaths)
+# 
+# attage_knots <- unique(attage_ecdf(knot_loc_ptiles))
+# 
+# face_amt_ecdf <- model_data.train %>%
+#   approx_ecdf(face_amount_band_int, number_of_deaths)
+# 
+# face_amt_knots <- unique(face_amt_ecdf(knot_loc_ptiles))
+# 
+# duration_knots <- log(c(10, 15))
+# 
+# issue_age_ecdf <- model_data.train %>%
+#   approx_ecdf(issue_age, number_of_deaths)
+# 
+# issue_age_knots <- c(28, 38, 45, 50, 54, 58, 62, 66, 70)
+# 
+# ATTAGE_PART = "splines::ns(attained_age, Boundary.knots = c(25, 95), knots=c(%KNOTS%))"
+# FACE_AMT_PART = "splines::bs(face_amount_band_int, degree=1, Boundary.knots = c(1, 11), knots=c(%KNOTS%))"
+# DUR_PART = "splines::bs(log(duration), degree=1, Boundary.knots = c(0, log(18)), knots=c(%KNOTS%))"
+# ISSAGE_PART = "splines::ns(issue_age, Boundary.knots = c(18, 75), knots=c(%KNOTS%))"
+# 
+# formula_template <- paste0(
+#   "number_of_deaths ~ preferred_class + smoker_status + ",
+#   stringr::str_glue("gender*{ATTAGE_PART} + {FACE_AMT_PART} + {DUR_PART}*{ISSAGE_PART}"),
+#   " -1"
+# )
+# 
+# spline_locations <- list()
+# 
+# spline_locations[[ATTAGE_PART]] <- attage_knots
+# spline_locations[[FACE_AMT_PART]] <- face_amt_knots
+# spline_locations[[DUR_PART]] <- duration_knots 
+# spline_locations[[ISSAGE_PART]] <- issue_age_knots 
+
+```
+
+```{r}
+# 
+# N_BITS <- length(attage_knots) + 
+#   length(face_amt_knots) + 
+#   length(duration_knots) +
+#   length(issue_age_knots)
+# 
+# bit_str_to_formula <- make_bit_str_to_formula(formula_template, spline_locations)
+# 
+# ga_fitness <- function(bit_string) {
+#   
+#   this_formula <- bit_str_to_formula(bit_string)
+#   
+#   X_mat <- model.matrix(this_formula, data=model_data.train)
+#   
+#   df_wts <- tibble(
+#     term_name = colnames(X_mat)) %>%
+#     mutate(
+#       lower_limits = case_when(
+#         stringr::str_detect(term_name, fixed("log(duration)")) ~ 0,
+#         TRUE ~ -Inf
+#       ),
+#       upper_limits = case_when(
+#         (stringr::str_detect(term_name, fixed("issue_age"))) &
+#           !(stringr::str_detect(term_name, fixed("log(duration)"))) ~ 0,
+#         TRUE ~ Inf
+#       )
+#     )
+# 
+#   glmnet_fit <- glmnet::glmnet(
+#     X_mat,
+#     model_data.train$number_of_deaths,
+#     offset = log(model_data.train$expected_deaths_08_vbt_ult),
+#     family = "poisson",
+#     intercept = T,
+#     lower.limits = df_wts$lower_limits,
+#     upper.limits = df_wts$upper_limits
+#   )
+#   
+#   aic_bic <- calc_aic_bic_glmnet(glmnet_fit)
+#   
+#   -1 * min(aic_bic$BIC)
+# }
+
+
+```
+
+```{r}
+
+# memo_fn_fitness <- memoise::memoise(ga_fitness)
+# 
+# best_model <- GA::ga(type="binary", 
+#        memo_fn_fitness, 
+#        popSize=20, 
+#        nBits = N_BITS, 
+#        maxiter = 5, 
+#        parallel = F,
+#        pmutation = 0.8,
+#        elitism = 1,
+#        suggestions = rbind(
+#          rep(0, N_BITS),
+#          rep(1, N_BITS)
+#        ),
+#        pcrossover=0.7)
+# 
+# bit_str_to_formula(best_model@solution)
+
+```
+
+
+```{r}
+
+# starting_sols <-matrix(
+#   rep(best_model@solution, 10), 
+#   nrow=10, 
+#   ncol=length(best_model@solution), byrow = T)
+# 
+# best_model <- GA::ga(type="binary", 
+#        memo_fn_fitness, 
+#        popSize=10, 
+#        nBits = N_BITS, 
+#        maxiter = 10, 
+#        parallel = F,
+#        pmutation = 0.3,
+#        elitism = 2,
+#        suggestions = starting_sols,
+#        pcrossover=0.0)
+# 
+# bit_str_to_formula(best_model@solution)
+
+```
+
+
+### Setup GLMNet recipe
+
+```{r}
+
+# DURATION_INTERP_START <- 10
+# DURATION_INTERP_END <- 15
+# DURATION_INTERP_POWER <- 0.33
+# 
+# prep_log_interp <- function(df) {
+#   df %>%
+#     mutate(
+#       c1 = pmin(1, pmax(0, DURATION_INTERP_END - duration) / (DURATION_INTERP_END - DURATION_INTERP_START))^DURATION_INTERP_POWER,
+#       c2 = 1 - c1,
+#       log_duration_interp = c1 * log(duration) + c2 * log(DURATION_INTERP_END)
+#     ) %>%
+#     select(-c1, -c2)
+# }
+# 
+# model_data.train <- model_data.train %>% prep_log_interp()
+# model_data.test <-  model_data.test %>% prep_log_interp()
+# 
+# best_formula <- number_of_deaths ~ 
+#     preferred_class + 
+#     smoker_status + 
+#     gender * 
+#       splines::ns(attained_age, Boundary.knots = c(25, 95), knots = c(35, 45, 52, 70)) +
+#     splines::bs(face_amount_band_int, degree = 1, Boundary.knots = c(1, 11), knots = c(2, 7)) + 
+#     log_duration_interp * splines::ns(issue_age, Boundary.knots = c(18, 75), knots = c(45, 58, 66, 70)) - 1
+# 
+# X_mat <- model.matrix(best_formula, data=model_data.train)
+# 
+# df_wts <- tibble(
+#   term_name = colnames(X_mat)) %>%
+#   mutate(
+#     lower_limits = case_when(
+#       stringr::str_detect(term_name, fixed("log(duration)")) ~ 0,
+#       TRUE ~ -Inf
+#     ),
+#     upper_limits = case_when(
+#       (stringr::str_detect(term_name, fixed("issue_age"))) &
+#         !(stringr::str_detect(term_name, fixed("log(duration)"))) ~ 0,
+#       TRUE ~ Inf
+#     )
+#   )
+# 
+# final_model <- glmnet::glmnet(
+#     X_mat,
+#     model_data.train$number_of_deaths,
+#     offset = log(model_data.train$expected_deaths_08_vbt_ult),
+#     family = "poisson",
+#     intercept = T,
+#     lower.limits = df_wts$lower_limits,
+#     upper.limits = df_wts$upper_limits
+#   )
+#   
+# aic_bic <- calc_aic_bic_glmnet(final_model)
+# 
+# min(aic_bic$BIC)
+
+```
+
+
+### Plot Deviance Ratio vs. Lambda
+
+```{r}
+
+# BEST_LAMBDA_IDX <- 35
+# 
+# best_lambda_val <- final_model$lambda[BEST_LAMBDA_IDX]
+# plot(final_model$dev.ratio, type="l")
+# points(BEST_LAMBDA_IDX, final_model$dev.ratio[BEST_LAMBDA_IDX])
+
+```
+
+
+### Examine model factors
+
+```{r}
+# 
+# best_coefs <- predict.glmnet(
+#   best_fit, newx=X_mat, s=best_lambda_val, type = "coefficients"
+# )
+# 
+# predictor_groups <- tibble(
+#   term_name = best_coefs@Dimnames[[1]]
+#   ) %>%
+#   mutate(
+#     term_group = case_when(
+#       stringr::str_detect(term_name, fixed("Intercept")) ~ "factor_base_rate",
+#       stringr::str_detect(term_name, fixed("preferred_class")) ~ "factor_preferred_class",
+#       stringr::str_detect(term_name, fixed("smoker_status")) ~ "factor_smoker_status",
+#       stringr::str_detect(term_name, fixed("gender")) |
+#         stringr::str_detect(term_name, fixed("attained_age")) ~ "factor_gender_x_attained_age",
+#       stringr::str_detect(term_name, fixed("issue_age")) |
+#         stringr::str_detect(term_name, fixed("duration")) ~ "factor_issue_age_x_duration",
+#       stringr::str_detect(term_name, fixed("face_amount_band_int")) ~ "factor_face_amount"
+#     )
+#   )
+# 
+# predictor_groups %>% view()
+```
+
+
+
+```{r}
+
+# pred_grid <- expand.grid(
+#   face_amount_band_int = seq(min(df_ph_data.train$face_amount_band_int), max(df_ph_data.train$face_amount_band_int), by=1),
+#   attained_age = seq(min(df_ph_data.train$attained_age), max(df_ph_data.train$attained_age), by=1),
+#   duration = seq(min(df_ph_data.train$duration), max(df_ph_data.train$duration), by=1),
+#   issue_age = seq(min(df_ph_data.train$issue_age), max(df_ph_data.train$issue_age), by=1),
+#   gender = unique(df_ph_data.train$gender),
+#   number_of_preferred_classes = unique(df_ph_data.train$number_of_preferred_classes),
+#   preferred_class = unique(df_ph_data.train$preferred_class),
+#   smoker_status = unique(df_ph_data.train$smoker_status),
+#   number_of_deaths = 0, 
+#   stringsAsFactors = F) %>% 
+#   filter(
+#     issue_age + duration - 1 == attained_age,
+#     ((smoker_status == "NONSMOKER") | ((smoker_status == "SMOKER") & (number_of_preferred_classes == "2"))),
+#     (
+#       ((number_of_preferred_classes == "2") & (preferred_class %in% c("1", "2"))) |
+#       ((number_of_preferred_classes == "3") & (preferred_class %in% c("1", "2", "3")))
+#     )) %>%
+#   prep_log_interp()
+# 
+# X_pred_grid <- cbind(
+#   rep(1, nrow(pred_grid)),
+#   model.matrix(best_formula, data=pred_grid)
+# )
+# 
+# coeff_diag <- rep(0, best_coefs@Dim[1])
+# coeff_diag[best_coefs@i + 1] <- best_coefs@x
+# coeff_diag <- diag(coeff_diag)
+# 
+# pred_mat <- X_pred_grid %*% coeff_diag
+# colnames(pred_mat) <- best_coefs@Dimnames[[1]]
+# 
+# pred_df <- pred_mat %>%
+#   as.data.frame() %>%
+#   mutate(
+#     pred_idx = row_number()) %>%
+#   pivot_longer(
+#     cols=-c(pred_idx), 
+#     names_to = "term_name", 
+#     values_to = "term_value") %>%
+#   inner_join(predictor_groups, by="term_name") %>%
+#   group_by(pred_idx, term_group) %>%
+#   summarise(
+#     total_value = exp(sum(term_value)),
+#     .groups = "drop"
+#   ) %>%
+#   ungroup() %>%
+#   pivot_wider(
+#     id_cols = pred_idx, names_from = "term_group", values_from = "total_value"
+#   )
+# 
+# full_pred_df <- bind_cols(
+#   pred_grid,
+#   pred_df
+# )
+
+```
+
+```{r}
+
+# plot_data <- full_pred_df %>%
+#   select(issue_age, duration, factor_issue_age_x_duration, factor_base_rate) %>%
+#   distinct()
+# 
+# ggplot(plot_data, aes(x=duration, y=factor_issue_age_x_duration, group=issue_age, color=issue_age)) +
+#   geom_line()
+
+```
+
+### Evaluate Model
+
+```{r}
+
+# colnames(model_data.train)
+
+```
+
+
+```{r}
+
+# BEST_LAMBDA_IDX <- 35
+# 
+# best_lambda_val <- ga_model$lambda[BEST_LAMBDA_IDX]
+# plot(ga_model$dev.ratio, type="l")
+# points(BEST_LAMBDA_IDX, ga_model$dev.ratio[BEST_LAMBDA_IDX])
+# 
+# aic_bic$BIC
+
+```
+
+
+### Check Model w/ Decision Tree
+
+```{r fig.width=10}
+
+# prep_rpart_data <- function(df) {
+#   X <- df %>% 
+#     select(-number_of_deaths, 
+#            -expected_deaths_08_vbt_ult, 
+#            -log_duration_interp,
+#            -pred_deaths)
+#   
+#   y <- df[, c("pred_deaths", "number_of_deaths")] %>%
+#     as.matrix()
+#   
+#   list(
+#     "X" = X,
+#     "y" = y
+#   )
+# }
+# 
+# rpart_data <- model_data.train %>%
+#   prep_rpart_data
+# 
+# model_errors <- rpart_data$y
+# 
+# rpart_model <- rpart(
+#   model_errors ~ .,
+#   data=rpart_data$X,
+#   method="poisson",
+#   control = rpart.control(cp=0.0001, maxdepth = 3))
+# 
+# rpart.plot(rpart_model, digits=4)
+
+```
+
+```{r fig.width=10}
+
+# rpart_data <- model_data.test %>%
+#   prep_rpart_data()
+# 
+# model_errors <- rpart_data$y
+# 
+# rpart_model <- rpart(
+#   model_errors ~ .,
+#   data=rpart_data$X,
+#   method="poisson",
+#   control = rpart.control(cp=0.0001, maxdepth = 3))
+# 
+# rpart.plot(rpart_model, digits=3)
+
+
+```
+
+
+
+```{r}
+
+interp_spline <- function(v, interp_start, interp_end, interp_power) {
+  c1 <- pmin(1, pmax(0, interp_end - v) / (interp_end - interp_start))^interp_power
+  c1 * v + (1-c1) * v
+}
+
+issue_age_groups <- list(
+  c(-Inf, seq(35, 75, by=10) ,Inf),
+  c(-Inf, 45, 55, 65, 75, Inf),
+  c(-Inf, 25, 35, 45, 55, 65, 75, Inf),
+  c(-Inf, 45, 55, 65, 70, Inf)
+)
+
+N_ISSUE_AGE_BITS <- log2(length(issue_age_groups))
+
+interp_params <- list(
+  
+  c(5, 15, 0.5),
+  c(7, 15, 0.5),
+  c(10, 15, 0.5),
+  c(13, 15, 0.5),
+  
+  c(5, 15, 0.66),
+  c(7, 15, 0.66),
+  c(10, 15, 0.66),
+  c(13, 15, 0.66),
+  
+  c(5, 10, 0.5),
+  c(7, 10, 0.5),
+  c(5, 15, 0.33),
+  c(7, 15, 0.33),
+  
+  c(5, 15, 0.66),
+  c(7, 15, 0.66),
+  c(3, 5, 0.66),
+  c(3, 5, 0.33)
+)
+
+N_INTERP_PARAM_BITS <- log2(length(interp_params))
+
+GENE_DEFINITION <- list(
+  "NS_ISS_AGES" = issue_age_groups,
+  "NS_INTERP" = interp_params,
+  "SMK_ISS_AGES" = issue_age_groups,
+  "SMK_INTERP" = interp_params
+)
+
+N_BITS <- sum(simplify(lapply(GENE_DEFINITION, function(g) { log2(length(g))})))
+
+if (!(as.integer(N_BITS) == N_BITS)) {
+  stop("parameter sets must be powers of 2 in length")
+}
+
+```
+
+```{r}
+
+bit_str_iter <- as.integer(round(runif(N_BITS,0, 1), 0))
+
+ga_formula <- number_of_deaths ~ 
+    preferred_class + 
+    gender * 
+      splines::ns(attained_age, Boundary.knots = c(25, 95), knots = c(35, 45, 52, 70)) +
+    splines::bs(face_amount_band_int, degree = 1, Boundary.knots = c(1, 11), knots = c(2, 7)) + 
+  AGE_GRPS_NS +
+  ns_ind*(AGE_GRPS_NS * log_interp_spline_ns) +
+  AGE_GRPS_SM +
+  sm_ind*(AGE_GRPS_SM * log_interp_spline_sm)
+
+ga_params <- list()
+
+bit_str_to_mm <- function(bit_str, model_data) {
+  
+  ga_params <- list()
+  
+  bit_str_iter <- bit_str
+  
+  for (parameter_name in names(GENE_DEFINITION)) {
+    
+    param_msg_len <- log2(length(GENE_DEFINITION[[parameter_name]]))
+    
+    msg_i <- bit_str_iter[1:param_msg_len]
+    msg_idx <- sum(
+      msg_i * 2^seq(0, param_msg_len - 1, by=1)
+    ) + 1
+    
+    ga_params[[parameter_name]] <- GENE_DEFINITION[[parameter_name]][msg_idx] %>%
+      simplify()
+    
+    # shift bit string
+    bit_str_iter <- bit_str_iter[-(1:param_msg_len)]
+  }
+  
+  if (length(bit_str_iter) != 0) {
+    stop("Message error (remaining bits)")
+  }
+  
+  curr_ns_breaks <- ga_params$NS_ISS_AGES
+  curr_sm_breaks <- ga_params$SMK_ISS_AGES
+  ns_spline_params <- ga_params$NS_INTERP
+  sm_spline_params <- ga_params$SMK_INTERP
+
+  ga_df <- model_data %>%
+    mutate(
+      sm_ind = ifelse(smoker_status == "SMOKER", 1, 0),
+      ns_ind = 1 - sm_ind,
+      AGE_GRPS_NS = cut(attained_age, breaks = curr_ns_breaks),
+      AGE_GRPS_SM = cut(attained_age, breaks = curr_sm_breaks),
+      log_interp_spline_ns = interp_spline(log(duration), 
+                                           !!ns_spline_params[1],
+                                           !!ns_spline_params[2],
+                                           !!ns_spline_params[3]),
+      log_interp_spline_sm = interp_spline(log(duration), 
+                                           !!sm_spline_params[1],
+                                           !!sm_spline_params[2],
+                                           !!sm_spline_params[3]))
+  
+  ga_mm <- model.matrix(
+    ga_formula, data=ga_df
+  )
+  
+  ga_wts <- tibble(
+    term_name = colnames(ga_mm)) %>%
+    mutate(
+      # must be increasing w/ duration -> lower limit == 0
+      lower_limits = case_when(
+        (stringr::str_detect(term_name, fixed("log_interp_spline"))) &
+          (stringr::str_detect(term_name, fixed("AGE_GRPS_"))) ~ 0,
+        TRUE ~ -Inf
+      ),
+      # must be less than 0 at start (issue) -> upper limit == 0
+      upper_limits = case_when(
+        (stringr::str_detect(term_name, fixed("AGE_GRPS_"))) &
+          !(stringr::str_detect(term_name, fixed("log_interp_spline"))) ~ 0,
+        TRUE ~ Inf
+      )
+    )
+  
+  list(
+    "model.matrix" = ga_mm,
+    "model.wts" = ga_wts,
+    "ga_params" = ga_params
+  )
+}
+
+
+```
+
+
+```{r}
+
+source("0_lib.R")
+
+ga_fitness_2 <- function(bit_string) {
+  
+  this_mm <- bit_str_to_mm(bit_string, model_data.train)
+    
+  print("fitting...")
+  glmnet_fit <- glmnet::glmnet(
+    this_mm$model.matrix,
+    model_data.train$number_of_deaths,
+    offset = log(model_data.train$expected_deaths_08_vbt_ult),
+    family = "poisson",
+    intercept = T,
+    lower.limits = this_mm$model.wts$lower_limits,
+    upper.limits = this_mm$model.wts$upper_limits
+  )
+  
+  aic_bic <- calc_aic_bic_glmnet(glmnet_fit)
+  
+  fitness_val <- -1 * min(aic_bic$AIC)
+  print(sprintf("\tfitness val: %.2f", fitness_val))
+  
+  fitness_val
+}
+
+
+memo_fn_fitness <- memoise::memoise(ga_fitness_2)
+
+best_model <- GA::ga(type="binary", 
+       memo_fn_fitness, 
+       popSize=20, 
+       crossover = GA::gabin_uCrossover,
+       nBits = N_BITS, 
+       maxiter = 5, 
+       parallel = F,
+       pmutation = 0.2,
+       elitism = 1,
+       pcrossover=0.7)
+
+bit_str_to_mm(best_model@solution[1, ], model_data.train)$ga_params
+
+
+```
+
+
+### Fit the best model
+
+```{r}
+
+best_mm <- bit_str_to_mm(best_model@solution[1, ], model_data.train)
+
+print("fitting...")
+best_fit <- glmnet::glmnet(
+  best_mm$model.matrix,
+  model_data.train$number_of_deaths,
+  offset = log(model_data.train$expected_deaths_08_vbt_ult),
+  family = "poisson",
+  intercept = T,
+  lower.limits = best_mm$model.wts$lower_limits,
+  upper.limits = best_mm$model.wts$upper_limits
+)
+
+aic_bic <- calc_aic_bic_glmnet(best_fit)
+  
+-1 * min(aic_bic$AIC)
+
+```
+
+
+### Append Predictions
+
+```{r}
+
+BEST_LAMBDA_IDX <- 50
+best_lambda_val <- best_fit$lambda[BEST_LAMBDA_IDX]
+
+best_mm.train <- bit_str_to_mm(
+  best_model@solution[1, ], 
+  model_data.train)
+
+model_data.train[["pred_deaths"]] <- predict(
+  best_fit, 
+  newx = best_mm.train$model.matrix,
+  s = best_lambda_val,
+  type="response",
+  newoffset = log(model_data.train$expected_deaths_08_vbt_ult)) %>%
+  c()
+
+best_mm.test <- bit_str_to_mm(
+  best_model@solution[1, ], 
+  model_data.test)
+
+model_data.test[["pred_deaths"]] <- predict(
+  best_fit, 
+  newx = best_mm.test$model.matrix,
+  s = best_lambda_val,
+  type="response",
+  newoffset = log(model_data.test$expected_deaths_08_vbt_ult)) %>%
+  c()
+
+list(
+  "train A/E" = sum(model_data.train$number_of_deaths) / sum(model_data.train$pred_deaths),
+  "test A/E" = sum(model_data.test$number_of_deaths) / sum(model_data.test$pred_deaths)
+)
+
+
+```
+
+
+
+### Examine model factors
+
+```{r}
+
+best_coefs <- predict.glmnet(
+  best_fit, newx=X_mat, s=best_lambda_val, type = "coefficients"
+)
+
+predictor_groups <- tibble(
+  term_name = best_coefs@Dimnames[[1]]
+  ) %>%
+  mutate(
+    term_group = case_when(
+      stringr::str_detect(term_name, fixed("Intercept")) ~ "factor_base_rate",
+      stringr::str_detect(term_name, fixed("preferred_class")) ~ "factor_preferred_class",
+      stringr::str_detect(term_name, fixed("smoker_status")) ~ "factor_smoker_status",
+      stringr::str_detect(term_name, fixed("gender")) |
+        stringr::str_detect(term_name, fixed("attained_age")) ~ "factor_gender_x_attained_age",
+      stringr::str_detect(term_name, fixed("issue_age")) |
+        stringr::str_detect(term_name, fixed("duration")) ~ "factor_issue_age_x_duration",
+      stringr::str_detect(term_name, fixed("face_amount_band_int")) ~ "factor_face_amount"
+    )
+  )
+
+predictor_groups %>% view()
+```
+
+
+
+```{r}
+
+pred_grid <- expand.grid(
+  face_amount_band_int = seq(min(df_ph_data.train$face_amount_band_int), max(df_ph_data.train$face_amount_band_int), by=1),
+  attained_age = seq(min(df_ph_data.train$attained_age), max(df_ph_data.train$attained_age), by=1),
+  duration = seq(min(df_ph_data.train$duration), max(df_ph_data.train$duration), by=1),
+  issue_age = seq(min(df_ph_data.train$issue_age), max(df_ph_data.train$issue_age), by=1),
+  gender = unique(df_ph_data.train$gender),
+  number_of_preferred_classes = unique(df_ph_data.train$number_of_preferred_classes),
+  preferred_class = unique(df_ph_data.train$preferred_class),
+  smoker_status = unique(df_ph_data.train$smoker_status),
+  number_of_deaths = 0, 
+  stringsAsFactors = F) %>% 
+  filter(
+    issue_age + duration - 1 == attained_age,
+    ((smoker_status == "NONSMOKER") | ((smoker_status == "SMOKER") & (number_of_preferred_classes == "2"))),
+    (
+      ((number_of_preferred_classes == "2") & (preferred_class %in% c("1", "2"))) |
+      ((number_of_preferred_classes == "3") & (preferred_class %in% c("1", "2", "3")))
+    )) %>%
+  prep_log_interp()
+
+X_pred_grid <- cbind(
+  rep(1, nrow(pred_grid)),
+  model.matrix(best_formula, data=pred_grid)
+)
+
+coeff_diag <- rep(0, best_coefs@Dim[1])
+coeff_diag[best_coefs@i + 1] <- best_coefs@x
+coeff_diag <- diag(coeff_diag)
+
+pred_mat <- X_pred_grid %*% coeff_diag
+colnames(pred_mat) <- best_coefs@Dimnames[[1]]
+
+pred_df <- pred_mat %>%
+  as.data.frame() %>%
+  mutate(
+    pred_idx = row_number()) %>%
+  pivot_longer(
+    cols=-c(pred_idx), 
+    names_to = "term_name", 
+    values_to = "term_value") %>%
+  inner_join(predictor_groups, by="term_name") %>%
+  group_by(pred_idx, term_group) %>%
+  summarise(
+    total_value = exp(sum(term_value)),
+    .groups = "drop"
+  ) %>%
+  ungroup() %>%
+  pivot_wider(
+    id_cols = pred_idx, names_from = "term_group", values_from = "total_value"
+  )
+
+full_pred_df <- bind_cols(
+  pred_grid,
+  pred_df
+)
+
+```
