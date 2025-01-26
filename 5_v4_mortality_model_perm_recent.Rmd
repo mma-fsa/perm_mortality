@@ -200,15 +200,6 @@ slope_intercept_idx <- which(
   (str_detect(colnames(X_mat), pattern = fixed("log_interp_spline")))
 )
 
-obj_fn <- make_likelihood(
-  X_mat, y_vec, offset_vec
-)
-
-grad_fn <- make_gradient(
-  X_mat, y_vec, offset_vec
-)
-
-
 ```
 
 ```{r}
@@ -258,7 +249,8 @@ warmup_limits <- tibble(
 
 warmup_limits[warmup_dur_int_idx, "upper_limits"] <- 0
 warmup_limits[warmup_slope_int_idx, "lower_limits"] <- 0
-warmup_limits[c(warmup_dur_int_idx, warmup_slope_int_idx), "penalty"] <- 0.01
+warmup_limits[warmup_slope_int_idx, "upper_limits"] <- 1 / log(15)
+warmup_limits[c(warmup_dur_int_idx, warmup_slope_int_idx), "penalty"] <- 0.2
 
 rownames(warmup_limits) <- colnames(X_warmup)
 
@@ -294,10 +286,12 @@ length(init_param)
 ```
 ```{r}
 
+BEST_IDX <- 100
+
 predict(warmup_fit,
         newx = X_warmup,
         newoffset = offset_vec,
-        s = warmup_fit$lambda[20],
+        s = warmup_fit$lambda[BEST_IDX],
         type = "response") %>%
   c() %>%
   sum()
@@ -310,10 +304,75 @@ sum(y_vec) / sum(exp(offset_vec))
 
 ```
 
+```{r}
+
+coef(warmup_fit)[, BEST_IDX][duration_intercept_idx]
+
+```
+
+
+```{r}
+
+coef(warmup_fit)[, BEST_IDX][slope_intercept_idx]
+
+```
+
+
+```{r}
+
+exp(coef(warmup_fit)[, BEST_IDX][duration_intercept_idx] + 
+     coef(warmup_fit)[, BEST_IDX][slope_intercept_idx] * log(1))
+
+```
+
+```{r}
+
+exp(coef(warmup_fit)[, BEST_IDX][duration_intercept_idx] + 
+     coef(warmup_fit)[, BEST_IDX][slope_intercept_idx] * log(15))
+
+```
 
 ```{r}
 
 sum(model_data.train$number_of_deaths) / sum(exp(X_mat %*% init_param + log(model_data.train$expected_deaths_08_vbt_ult)))
+
+```
+
+```{r}
+
+intercept_adjustment <- -1*(coef(warmup_fit)[, BEST_IDX][duration_intercept_idx] + 
+     coef(warmup_fit)[, BEST_IDX][slope_intercept_idx] * log(15))
+
+init_param[duration_intercept_idx] <- init_param[duration_intercept_idx] + intercept_adjustment
+
+```
+
+
+```{r}
+
+select_param_idx <- c(duration_intercept_idx, slope_intercept_idx)
+
+optim_init_params <- init_param[-select_param_idx]
+offset_params <- init_param[select_param_idx]
+
+X_optim <- X_mat[, -select_param_idx]
+X_offset <- X_mat[, select_param_idx]
+
+new_offset_vec <- offset_vec + X_offset %*% offset_params
+
+```
+
+
+
+```{r}
+
+obj_fn <- make_likelihood(
+  X_optim, y_vec, new_offset_vec
+)
+
+grad_fn <- make_gradient(
+  X_optim, y_vec, new_offset_vec
+)
 
 ```
 
@@ -322,37 +381,43 @@ sum(model_data.train$number_of_deaths) / sum(exp(X_mat %*% init_param + log(mode
 
 hin <- function(x) {
   ineq_vals <- rep(0, length(x))
-  #ineq_vals[duration_intercept_idx] <- x[duration_intercept_idx]
-  #ineq_vals[slope_intercept_idx] <- -x[slope_intercept_idx]
+  # ineq_vals[duration_intercept_idx] <- x[duration_intercept_idx]
+  # ineq_vals[slope_intercept_idx] <- -x[slope_intercept_idx]
   ineq_vals
 }
 
 heq <- function(x) { 
   eq_vals <- rep(0, length(x))
-  eq_vals[25] <- x[17] + log(15)*x[25]
-  eq_vals[26] <- x[18] + log(15)*x[26]
-  eq_vals[27] <- x[19] + log(15)*x[27]
-  eq_vals[28] <- x[20] + log(15)*x[28]
-  eq_vals[29] <- x[21] + log(15)*x[29]
-  eq_vals[30] <- x[22] + log(15)*x[30]
-  eq_vals[31] <- x[23] + log(15)*x[31]
-  eq_vals[32] <- x[24] + log(15)*x[32]
+  # eq_vals[25] <- x[17] + log(15)*x[25]
+  # eq_vals[26] <- x[18] + log(15)*x[26]
+  # eq_vals[27] <- x[19] + log(15)*x[27]
+  # eq_vals[28] <- x[20] + log(15)*x[28]
+  # eq_vals[29] <- x[21] + log(15)*x[29]
+  # eq_vals[30] <- x[22] + log(15)*x[30]
+  # eq_vals[31] <- x[23] + log(15)*x[31]
+  # eq_vals[32] <- x[24] + log(15)*x[32]
   eq_vals
 }
 
-this_init <- init_param
+this_init <- optim_init_params
 this_init[1] <- 0
 
-optim_res <- nloptr::auglag(init_param, 
+optim_res <- nloptr::auglag(this_init, 
        obj_fn, 
        gr = grad_fn, 
        hin = hin, 
        heq = hin, 
        deprecatedBehavior = FALSE,
        control=nl.opts(list(maxeval = 10000)),
-       localsolver = "lbfgs")
+       localsolver = "LBFGS")
 
 optim_res
+
+```
+
+```{r}
+
+optim_res$par - optim_init_params
 
 ```
 
