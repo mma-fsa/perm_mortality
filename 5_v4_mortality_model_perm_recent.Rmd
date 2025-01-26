@@ -1,0 +1,391 @@
+---
+title: "Perm Mortality Model"
+author: "Mike McPhee Anderson, FSA"
+date: "2024-12-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(glmnet)
+library(xgboost)
+library(recipes)
+library(rpart)
+library(rpart.plot)
+library(splines)
+library(rsample)
+library(shapviz)
+library(tidyselect)
+library(doMC)
+library(tidyverse)
+library(nloptr)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# Overview
+
+## Models
+
+Within the ILEC data "Perm" (permanent) life insurance category, there
+are some major differences in the underwriting / target market that can be inferred via EDA. 
+These differences lead us to three distinct models:
+
+ 1. *Simplified Issue:* Policies issued after 2005 without any preferred classes are likely simplified
+   issue.  These policies are less than $100K face amount, and are likely to have less stringent underwriting.
+   
+ 2. *Fully Underwritten (recent):*  Post-2005 policies are likely to have at least one preferred class, and I recall that blood testing gained traction in the late 1990s.  These policies will also have some underwriting class selection (select period) that is still applicable.
+ 
+ 3. *Fully Underwritten (historical):*  Policies prior to 2005 are likely to have little remaining effects from underwriting selection.  Also, this data is unlikely to have preferred classes, and is mostly just smoker vs. non-smoker for underwriting classes.  The majority of it will be smaller face amounts.
+ 
+## Training and Testing Splits
+
+Unfortunately, the ILEC data is aggregated in such a way that makes a typical train / test split cumbersome. While we could sample the exposures and deaths for each aggregated cell, things like fractional exposures and the actuarial custom of setting deaths to have a full year of exposure introduce some opportunities for noise.  
+
+Instead, we'll use the most recent two years of data for testing, and perform cross-validation within the training set by observation year.  This is more closely aligned with what an "unseen observation" is in practice, i.e., another calendar year of data.  
+
+# Setup 
+
+## Load Data
+
+```{r}
+
+face_amount_order <- c(
+  "1-9999",
+  "10000-24999",
+  "25000-49999",
+  "50000-99999",
+  "100000-249999",
+  "250000-499999",
+  "500000-999999",
+  "1000000-2499999",
+  "2500000-4999999",
+  "5000000-9999999",
+  "10000000+"
+)
+
+df_study_data <- read_rds("ilec_perm_recent.rds") %>%
+  mutate(
+    train_test = ifelse(observation_year >= 2016, "TEST", "TRAIN"),
+      # no selection period, just ultimate mortality
+    expected_deaths_08_vbt_ult = coalesce(qx * policies_exposed),
+    # create ordered factor + integer representation of face amount bands
+    face_amount_band = ordered(face_amount_band, levels=!!face_amount_order),
+    face_amount_band_int = as.integer(face_amount_band),
+    issue_age = attained_age - duration + 1
+  ) %>%
+  filter(expected_deaths_08_vbt_ult > 0)
+
+```
+
+# Perm Historical Model
+
+## Train Test Split
+
+```{r}
+
+df_ph_data <- df_study_data 
+
+df_ph_data.train <- df_ph_data %>% 
+  filter(train_test == "TRAIN")
+
+df_ph_data.test <- df_ph_data %>%
+  filter(train_test == "TEST")
+
+df_ph_data %>%
+  group_by(train_test) %>%
+  summarise(
+    n_deaths = sum(number_of_deaths),
+    .groups="drop"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    pct_deaths = n_deaths / sum(n_deaths)
+  )
+
+```
+
+
+
+```{r}
+
+summary(df_ph_data.train)
+
+```
+
+```{r}
+
+log_interp_spline <- function(v, interp_start, interp_end, interp_power) {
+  c1 <- pmin(1, pmax(0, interp_end - v) / (interp_end - interp_start))^interp_power
+  c1 * log(v) + (1-c1) * log(interp_end)
+}
+
+curr_ns_breaks <- c(-Inf, seq(45, 65, by=10), Inf)
+curr_sm_breaks <- c(-Inf, seq(45, 65, by=10), Inf)
+ns_spline_params <- c(10, 15, 0.5)
+sm_spline_params <- c(5, 10, 0.5)
+
+group_model_data <- function(df) {
+  df %>%
+    group_by(attained_age, duration, issue_age, number_of_preferred_classes,
+             preferred_class, smoker_status, face_amount_band_int, gender) %>%
+    summarise(
+      number_of_deaths = sum(number_of_deaths),
+      expected_deaths_08_vbt_ult = sum(expected_deaths_08_vbt_ult),
+      .groups="drop"
+    ) %>%
+    ungroup() %>%
+    mutate(
+      sm_ind = ifelse(smoker_status == "SMOKER", 1, 0),
+      ns_ind = ifelse(smoker_status == "NONSMOKER", 1, 0),
+      AGE_GRPS_NS = cut(issue_age, breaks = curr_ns_breaks),
+      AGE_GRPS_SM = cut(issue_age, breaks = curr_sm_breaks),
+      log_interp_spline_ns = log_interp_spline(duration, 
+                                           !!ns_spline_params[1],
+                                           !!ns_spline_params[2],
+                                           !!ns_spline_params[3]),
+      log_interp_spline_sm = log_interp_spline(duration, 
+                                           !!sm_spline_params[1],
+                                           !!sm_spline_params[2],
+                                           !!sm_spline_params[3])
+    )
+}
+
+model_data.train <- df_ph_data.train %>% group_model_data()
+model_data.test <- df_ph_data.test %>% group_model_data()
+
+```
+
+
+## Fit Model with L-BFGS
+
+```{r}
+
+make_likelihood <- function(X, y, offset) {
+  function(beta) {
+    Xbeta <- X %*% beta + offset
+    -(sum(y * Xbeta - exp(Xbeta)))
+  }  
+}
+
+make_gradient <- function(X, y, offset) {
+  function(beta) {
+    Xbeta <- X %*% beta + offset
+    -(crossprod(X, (y - exp(Xbeta))))
+  }  
+}
+
+exp_basis_formula <- number_of_deaths ~ 
+  smoker_status * splines::ns(attained_age, 
+                              Boundary.knots = c(25, 95), 
+                              knots = c(35, 40, 45, 52, 70, 80)) +
+  ns_ind:AGE_GRPS_NS +
+  ns_ind:AGE_GRPS_NS:log_interp_spline_ns +
+  sm_ind:AGE_GRPS_SM +
+  sm_ind:AGE_GRPS_SM:log_interp_spline_sm 
+
+X_mat <- model.matrix(
+  exp_basis_formula,
+  data=model_data.train
+)
+
+y_vec <- model_data.train$number_of_deaths
+offset_vec <- log(model_data.train$expected_deaths_08_vbt_ult)
+
+duration_intercept_idx <- which(str_detect(colnames(X_mat), pattern = fixed("AGE_GRPS_")) &
+  !(str_detect(colnames(X_mat), pattern = fixed("log_interp_spline"))))
+
+slope_intercept_idx <- which(
+  (str_detect(colnames(X_mat), pattern = fixed("log_interp_spline")))
+)
+
+obj_fn <- make_likelihood(
+  X_mat, y_vec, offset_vec
+)
+
+grad_fn <- make_gradient(
+  X_mat, y_vec, offset_vec
+)
+
+
+```
+
+```{r}
+
+# warmup_X <- X_mat[, -c(duration_intercept_idx, slope_intercept_idx)]
+# 
+# warmup_fit <- glm.fit(
+#   warmup_X,
+#   y_vec,
+#   offset = offset_vec,
+#   family = poisson()
+# )
+# 
+# init_param <- rep(0, ncol(X_mat))
+# 
+# warmup_idx <- vapply(names(coef(warmup_fit)), 
+#        function(x) {
+#         which(x == colnames(X_mat))
+#       }, c(0))
+# 
+# 
+# init_param[warmup_idx] <- coef(warmup_fit)[warmup_idx]
+# init_param[duration_intercept_idx] <- rep(-1, length(duration_intercept_idx))
+# init_param[slope_intercept_idx] <- rep(1 / log(15), length(duration_intercept_idx))
+#  
+# length(init_param)
+# 
+
+```
+
+```{r}
+
+# coeff_diag <- rep(0, best_coefs@Dim[1])
+# coeff_diag[best_coefs@i + 1] <- best_coefs@x
+# coeff_diag <- diag(coeff_diag)
+
+X_warmup <- X_mat[,-c(1)]
+
+warmup_dur_int_idx <- duration_intercept_idx - 1
+warmup_slope_int_idx <- slope_intercept_idx - 1
+
+warmup_limits <- tibble(
+  upper_limits = rep(Inf, ncol(X_warmup)),
+  lower_limits = rep(-Inf, ncol(X_warmup)),
+  penalty = rep(1, ncol(X_warmup))
+) 
+
+warmup_limits[warmup_dur_int_idx, "upper_limits"] <- 0
+warmup_limits[warmup_slope_int_idx, "lower_limits"] <- 0
+warmup_limits[c(warmup_dur_int_idx, warmup_slope_int_idx), "penalty"] <- 0.01
+
+rownames(warmup_limits) <- colnames(X_warmup)
+
+warmup_fit <- glmnet::glmnet(
+  X_warmup,
+  y_vec,
+  offset = offset_vec,
+  family = "poisson",
+  intercept = T,
+  lower.limits = warmup_limits$lower_limits,
+  upper.limits = warmup_limits$upper_limits,
+  penalty.factor = warmup_limits$penalty
+)
+
+```
+
+```{r}
+
+init_param <- coef(warmup_fit)[,100] 
+
+check_init_params <- bind_cols(
+  tibble(param_val = init_param[-1]), warmup_limits)
+
+view(check_init_params)
+
+```
+
+
+```{r}
+
+length(init_param)
+
+```
+```{r}
+
+predict(warmup_fit,
+        newx = X_warmup,
+        newoffset = offset_vec,
+        s = warmup_fit$lambda[20],
+        type = "response") %>%
+  c() %>%
+  sum()
+
+```
+
+```{r}
+
+sum(y_vec) / sum(exp(offset_vec))
+
+```
+
+
+```{r}
+
+sum(model_data.train$number_of_deaths) / sum(exp(X_mat %*% init_param + log(model_data.train$expected_deaths_08_vbt_ult)))
+
+```
+
+
+```{r}
+
+hin <- function(x) {
+  ineq_vals <- rep(0, length(x))
+  #ineq_vals[duration_intercept_idx] <- x[duration_intercept_idx]
+  #ineq_vals[slope_intercept_idx] <- -x[slope_intercept_idx]
+  ineq_vals
+}
+
+heq <- function(x) { 
+  eq_vals <- rep(0, length(x))
+  eq_vals[25] <- x[17] + log(15)*x[25]
+  eq_vals[26] <- x[18] + log(15)*x[26]
+  eq_vals[27] <- x[19] + log(15)*x[27]
+  eq_vals[28] <- x[20] + log(15)*x[28]
+  eq_vals[29] <- x[21] + log(15)*x[29]
+  eq_vals[30] <- x[22] + log(15)*x[30]
+  eq_vals[31] <- x[23] + log(15)*x[31]
+  eq_vals[32] <- x[24] + log(15)*x[32]
+  eq_vals
+}
+
+this_init <- init_param
+this_init[1] <- 0
+
+optim_res <- nloptr::auglag(init_param, 
+       obj_fn, 
+       gr = grad_fn, 
+       hin = hin, 
+       heq = hin, 
+       deprecatedBehavior = FALSE,
+       control=nl.opts(list(maxeval = 10000)),
+       localsolver = "lbfgs")
+
+optim_res
+
+```
+
+
+```{r}
+
+optim_res$par[duration_intercept_idx]
+
+```
+
+
+```{r}
+
+optim_res$par[slope_intercept_idx]
+
+```
+
+
+```{r}
+
+exp(optim_res$par[duration_intercept_idx] + optim_res$par[slope_intercept_idx] * log(1))
+
+```
+
+```{r}
+
+exp(optim_res$par[duration_intercept_idx] + optim_res$par[slope_intercept_idx] * log(15))
+
+```
+
+```{r}
+
+sum(model_data.train$number_of_deaths) / sum(exp(X_mat %*% optim_res$par + log(model_data.train$expected_deaths_08_vbt_ult)))
+
+```
+
