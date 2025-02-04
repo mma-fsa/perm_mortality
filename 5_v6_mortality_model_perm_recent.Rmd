@@ -128,6 +128,7 @@ sm_spline_params <- c(10, 15, 0.5)
 
 group_model_data <- function(df) {
   df %>%
+    mutate(attained_age = pmin(95, attained_age)) %>%
     group_by(attained_age, duration, issue_age, number_of_preferred_classes,
              preferred_class, smoker_status, face_amount_band_int, gender) %>%
     summarise(
@@ -147,15 +148,17 @@ group_model_data <- function(df) {
 model_data.train <- df_ph_data.train %>% group_model_data()
 model_data.test <- df_ph_data.test %>% group_model_data()
 
+summary(model_data.train)
 ```
 
 
 ```{r}
 
 exp_basis_formula <- number_of_deaths ~ 
-  sm_ind * splines::ns(attained_age, 
+  sm_ind * splines::bs(attained_age, 
                               Boundary.knots = c(25, 95), 
-                              knots = c(35, 40, 45, 52, 70, 80)) +
+                              knots = c(35, 40, 45, 52, 70, 80),
+                       degree=3) +
   ns_ind:AGE_GRPS_NS +
   sm_ind:AGE_GRPS_SM - 1
 
@@ -390,13 +393,16 @@ optim_start <- init_param[training_param_idx]
 # less than or equal to zero
 hin <- function(x) {
   ineq_vals <- rep(0, length(x))
-  ineq_vals[4] <- x[3] - x[4]
-  ineq_vals[5] <- x[4] - x[5]
-  ineq_vals[5] <- x[5] - x[6]
-  ineq_vals[6] <- x[6] - x[7]
-  ineq_vals[7] <- x[7] - x[8]
-  ineq_vals[8] <- x[8] - x[7]
-  ineq_vals[9] <- x[9] - x[8]
+  ineq_vals[3] <- -1 * (x[3] - x[4])
+  ineq_vals[4] <- x[4]
+  # ineq_vals[5] <- x[4] - x[5]
+  # ineq_vals[5] <- x[5] - x[6]
+  # ineq_vals[6] <- x[6] - x[7]
+  # ineq_vals[7] <- x[7] - x[8]
+  # ineq_vals[8] <- x[8] - x[7]
+  # ineq_vals[9] <- x[9] - x[8]
+  # ineq_vals[10] <- x[10] - x[9]
+  ineq_vals[11] <- x[11] - x[10]
   ineq_vals
 }
 
@@ -425,9 +431,8 @@ optim_res
 ```{r}
 names(optim_res$par) <- names(optim_start)
 
-optim_res$par[3:9]
+optim_res$par[3:11]
 ```
-
 
 ```{r}
 
@@ -442,13 +447,14 @@ sum(model_data.train$number_of_deaths) /
 
 test_attage <- seq(25, 95)
 
-X_attage <- splines::ns(test_attage, 
-            Boundary.knots = c(25, 95), 
-            knots = c(35, 40, 45, 52, 70, 80))
+X_attage <- splines::bs(test_attage, 
+                              Boundary.knots = c(25, 95), 
+                              knots = c(35, 40, 45, 52, 70, 80),
+                       degree=3) 
 
 plot(
   test_attage,
-  X_attage %*% optim_res$par[3:9],
+  X_attage %*% optim_res$par[3:11],
   type="l"
 )
 

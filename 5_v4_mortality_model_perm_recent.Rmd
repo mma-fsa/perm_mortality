@@ -124,7 +124,7 @@ log_interp_spline <- function(v, interp_start, interp_end, interp_power) {
 curr_ns_breaks <- c(-Inf, seq(45, 65, by=10), Inf)
 curr_sm_breaks <- c(-Inf, seq(45, 65, by=10), Inf)
 ns_spline_params <- c(10, 15, 0.5)
-sm_spline_params <- c(5, 10, 0.5)
+sm_spline_params <- c(10, 15, 0.5)
 
 group_model_data <- function(df) {
   df %>%
@@ -421,36 +421,54 @@ optim_res$par - optim_init_params
 
 ```
 
+```{r}
+
+sum(model_data.train$number_of_deaths) / 
+  sum(exp(X_optim %*% optim_res$par + new_offset_vec))
+
+```
 
 ```{r}
 
-optim_res$par[duration_intercept_idx]
+model_data.train[["final_pred"]] <- exp(X_optim %*% optim_res$par + new_offset_vec)
 
 ```
 
 
 ```{r}
 
-optim_res$par[slope_intercept_idx]
+plot_data <- model_data.train %>%
+  group_by(attained_age, smoker_status) %>%
+  summarise(
+    ae = sum(number_of_deaths) / sum(final_pred),
+    .groups="drop"
+  ) %>%
+  ungroup()
+
+
+ggplot(plot_data, aes(x=attained_age, y=ae, color=smoker_status, group=smoker_status)) +
+  geom_line()
+
 
 ```
-
-
 ```{r}
 
-exp(optim_res$par[duration_intercept_idx] + optim_res$par[slope_intercept_idx] * log(1))
 
-```
+plot_data <- model_data.train %>%
+  group_by(AGE_GRPS_NS, smoker_status, duration) %>%
+  summarise(
+    ae = sum(number_of_deaths) / sum(final_pred),
+    .groups="drop"
+  ) %>%
+  ungroup()
 
-```{r}
 
-exp(optim_res$par[duration_intercept_idx] + optim_res$par[slope_intercept_idx] * log(15))
+ggplot(plot_data, aes(x=duration, y=ae, color=smoker_status, group=smoker_status)) +
+  facet_wrap(~ AGE_GRPS_NS, scales = "free_y") +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  theme_bw()
 
-```
-
-```{r}
-
-sum(model_data.train$number_of_deaths) / sum(exp(X_mat %*% optim_res$par + log(model_data.train$expected_deaths_08_vbt_ult)))
 
 ```
 
