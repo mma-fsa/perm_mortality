@@ -19,6 +19,9 @@ library(tidyselect)
 library(doMC)
 library(tidyverse)
 
+source("0_lib.R")
+source("0_ga_lib.R")
+
 knitr::opts_chunk$set(echo = TRUE)
 
 ```
@@ -307,12 +310,19 @@ ph.glmnet.recipe <- recipe(number_of_deaths ~ face_amount_band_int +
                              gender +
                              number_of_preferred_classes +
                              preferred_class +
-                             smoker_status,
+                             smoker_status + 
+                             expected_deaths_08_vbt_ult,
                            data = model_data.train) %>%
   step_my_model_factor_prep() %>%
+  step_mutate(
+    log_duration_interp = log_interp_spline(duration, 10, 15, 0.33)
+  ) %>%
   prep(model_data.train, retain=F)
 
-bake(ph.glmnet.recipe, model_data.train) %>%
+model_data.train <- bake(ph.glmnet.recipe, model_data.train) 
+model_data.test <- bake(ph.glmnet.recipe, model_data.test)
+
+model_data.train %>%
   summary()
 
 ```
@@ -320,168 +330,85 @@ bake(ph.glmnet.recipe, model_data.train) %>%
 
 ```{r}
 
-source("0_lib.R")
-
-knot_loc_ptiles <- seq(0.05, 0.95, by=0.1)
-
-attage_ecdf <- model_data.train %>%
-  approx_ecdf(attained_age, number_of_deaths)
-
-attage_knots <- unique(attage_ecdf(knot_loc_ptiles))
-
-face_amt_ecdf <- model_data.train %>%
-  approx_ecdf(face_amount_band_int, number_of_deaths)
-
-face_amt_knots <- unique(face_amt_ecdf(knot_loc_ptiles))
-
-duration_knots <- log(c(10, 15))
-
-issue_age_ecdf <- model_data.train %>%
-  approx_ecdf(issue_age, number_of_deaths)
-
-issue_age_knots <- c(28, 38, 45, 50, 54, 58, 62, 66, 70)
-
-ATTAGE_PART = "splines::ns(attained_age, Boundary.knots = c(25, 95), knots=c(%KNOTS%))"
-FACE_AMT_PART = "splines::bs(face_amount_band_int, degree=1, Boundary.knots = c(1, 11), knots=c(%KNOTS%))"
-DUR_PART = "splines::bs(log(duration), degree=1, Boundary.knots = c(0, log(18)), knots=c(%KNOTS%))"
-ISSAGE_PART = "splines::ns(issue_age, Boundary.knots = c(18, 75), knots=c(%KNOTS%))"
-
-formula_template <- paste0(
-  "number_of_deaths ~ preferred_class + smoker_status + ",
-  stringr::str_glue("gender*{ATTAGE_PART} + {FACE_AMT_PART} + {DUR_PART}*{ISSAGE_PART}"),
-  " -1"
-)
-
-spline_locations <- list()
-
-spline_locations[[ATTAGE_PART]] <- attage_knots
-spline_locations[[FACE_AMT_PART]] <- face_amt_knots
-spline_locations[[DUR_PART]] <- duration_knots 
-spline_locations[[ISSAGE_PART]] <- issue_age_knots 
-
-```
-
-```{r}
-
-N_BITS <- length(attage_knots) + 
-  length(face_amt_knots) + 
-  length(duration_knots) +
-  length(issue_age_knots)
-
-bit_str_to_formula <- make_bit_str_to_formula(formula_template, spline_locations)
-
-ga_fitness <- function(bit_string) {
-  
-  this_formula <- bit_str_to_formula(bit_string)
-  
-  X_mat <- model.matrix(this_formula, data=model_data.train)
-  
-  df_wts <- tibble(
-    term_name = colnames(X_mat)) %>%
-    mutate(
-      lower_limits = case_when(
-        stringr::str_detect(term_name, fixed("log(duration)")) ~ 0,
-        TRUE ~ -Inf
-      ),
-      upper_limits = case_when(
-        (stringr::str_detect(term_name, fixed("issue_age"))) &
-          !(stringr::str_detect(term_name, fixed("log(duration)"))) ~ 0,
-        TRUE ~ Inf
-      )
-    )
-
-  glmnet_fit <- glmnet::glmnet(
-    X_mat,
-    model_data.train$number_of_deaths,
-    offset = log(model_data.train$expected_deaths_08_vbt_ult),
-    family = "poisson",
-    intercept = T,
-    lower.limits = df_wts$lower_limits,
-    upper.limits = df_wts$upper_limits
-  )
-  
-  aic_bic <- calc_aic_bic_glmnet(glmnet_fit)
-  
-  -1 * min(aic_bic$BIC)
+qtiles <- function(x) {
+  unique(quantile(x, probs=seq(0.05, 0.95, by=0.05)))
 }
 
+ga_def <- with(model_data.train, {
+  ga_knot_search(
+    # define formula w/ knot search placeholders
+    number_of_deaths ~ preferred_class + 
+      smoker_status + 
+      gender * ATT_AGE +
+      FACE_BAND + 
+      log_duration_interp * ISSUE_AGE - 1,
+    # offset term
+    offset = log(expected_deaths_08_vbt_ult),
+    # define knot search
+    ATT_AGE = ga_knot_def_ns(
+      attained_age,
+      qtiles(attained_age)),
+    FACE_BAND = ga_knot_def_bs(
+      face_amount_band_int, 
+      qtiles(face_amount_band_int)
+    ),
+    ISSUE_AGE = ga_knot_def_ns(
+      issue_age, 
+      qtiles(issue_age)))
+})
+
+total_bits <- sum(vapply(ga_def$knot_definitions, function(x) { x$n_bits }, 
+                     FUN.VALUE = c(0)))
+
+fake_bitstr <- rbinom(total_bits, 1, prob=0.5)
+
+ga_def$eval_bitstr(fake_bitstr)
 
 ```
 
-```{r}
-
-memo_fn_fitness <- memoise::memoise(ga_fitness)
-
-best_model <- GA::ga(type="binary", 
-       memo_fn_fitness, 
-       popSize=20, 
-       nBits = N_BITS, 
-       maxiter = 5, 
-       parallel = F,
-       pmutation = 0.8,
-       elitism = 1,
-       suggestions = rbind(
-         rep(0, N_BITS),
-         rep(1, N_BITS)
-       ),
-       pcrossover=0.7)
-
-bit_str_to_formula(best_model@solution)
-
-```
 
 
 ```{r}
 
-starting_sols <-matrix(
-  rep(best_model@solution, 10), 
-  nrow=10, 
-  ncol=length(best_model@solution), byrow = T)
-
 best_model <- GA::ga(type="binary", 
-       memo_fn_fitness, 
+       ga_def$eval_bitstr, 
        popSize=10, 
-       nBits = N_BITS, 
-       maxiter = 10, 
+       nBits = ga_def$total_bits, 
+       maxiter = 50, 
        parallel = F,
        pmutation = 0.3,
-       elitism = 2,
-       suggestions = starting_sols,
-       pcrossover=0.0)
-
-bit_str_to_formula(best_model@solution)
+       elitism = 1,
+       suggestions = ga_def$initial_suggestions,
+       pcrossover=0.7)
 
 ```
 
+```{r}
+
+ga_def$bitstr_to_formula(best_model@solution)
+
+```
+
+```{r}
+
+ga_def$bitstr_to_formula(best_model@solution)
+
+```
 
 ### Setup GLMNet recipe
 
 ```{r}
 
-DURATION_INTERP_START <- 10
-DURATION_INTERP_END <- 15
-DURATION_INTERP_POWER <- 0.33
-
-prep_log_interp <- function(df) {
-  df %>%
-    mutate(
-      c1 = pmin(1, pmax(0, DURATION_INTERP_END - duration) / (DURATION_INTERP_END - DURATION_INTERP_START))^DURATION_INTERP_POWER,
-      c2 = 1 - c1,
-      log_duration_interp = c1 * log(duration) + c2 * log(DURATION_INTERP_END)
-    ) %>%
-    select(-c1, -c2)
-}
-
-model_data.train <- model_data.train %>% prep_log_interp()
-model_data.test <-  model_data.test %>% prep_log_interp()
-
 best_formula <- number_of_deaths ~ 
-    preferred_class + 
-    smoker_status + 
-    gender * 
-      splines::ns(attained_age, Boundary.knots = c(25, 95), knots = c(35, 45, 52, 70)) +
-    splines::bs(face_amount_band_int, degree = 1, Boundary.knots = c(1, 11), knots = c(2, 7)) + 
-    log_duration_interp * splines::ns(issue_age, Boundary.knots = c(18, 75), knots = c(45, 58, 66, 70)) - 1
+  preferred_class + 
+  smoker_status + 
+  splines::bs(face_amount_band_int, Boundary.knots = c(1, 11), knots = c(2, 9), degree = 1) + 
+  # gender + attained age interaction
+  gender * 
+    splines::ns(attained_age, Boundary.knots = c(25, 95), knots = c(29, 33, 41, 63, 69)) + 
+  # selection factor / policy year (UW) and issue age interaction
+  log_duration_interp * 
+    splines::ns(issue_age, Boundary.knots = c(18, 75), knots = c(31, 39, 64)) - 1
 
 X_mat <- model.matrix(best_formula, data=model_data.train)
 
@@ -489,12 +416,12 @@ df_wts <- tibble(
   term_name = colnames(X_mat)) %>%
   mutate(
     lower_limits = case_when(
-      stringr::str_detect(term_name, fixed("log(duration)")) ~ 0,
+      stringr::str_detect(term_name, fixed("log_duration_interp")) ~ 0,
       TRUE ~ -Inf
     ),
     upper_limits = case_when(
       (stringr::str_detect(term_name, fixed("issue_age"))) &
-        !(stringr::str_detect(term_name, fixed("log(duration)"))) ~ 0,
+        !(stringr::str_detect(term_name, fixed("log_duration_interp"))) ~ 0,
       TRUE ~ Inf
     )
   )
@@ -504,9 +431,7 @@ final_model <- glmnet::glmnet(
     model_data.train$number_of_deaths,
     offset = log(model_data.train$expected_deaths_08_vbt_ult),
     family = "poisson",
-    intercept = T,
-    lower.limits = df_wts$lower_limits,
-    upper.limits = df_wts$upper_limits
+    intercept = T
   )
   
 aic_bic <- calc_aic_bic_glmnet(final_model)
@@ -520,7 +445,7 @@ min(aic_bic$BIC)
 
 ```{r}
 
-BEST_LAMBDA_IDX <- 35
+BEST_LAMBDA_IDX <- 80
 
 best_lambda_val <- final_model$lambda[BEST_LAMBDA_IDX]
 plot(final_model$dev.ratio, type="l")
@@ -558,6 +483,8 @@ list(
 
 ### Check Model w/ Decision Tree
 
+#### Training Set
+
 ```{r fig.width=10}
 
 prep_rpart_data <- function(df) {
@@ -590,6 +517,8 @@ rpart_model <- rpart(
 rpart.plot(rpart_model, digits=4)
 ```
 
+#### Testing Set
+
 ```{r fig.width=10}
 
 rpart_data <- model_data.test %>%
@@ -607,6 +536,8 @@ rpart.plot(rpart_model, digits=3)
 
 
 ```
+
+### Look for patterns in misprediction
 
 
 

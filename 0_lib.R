@@ -71,3 +71,12 @@ calc_aic_bic_glmnet <- function(glmnet_fit) {
   
 }
 
+log_interp_spline <- function(duration, interp_start = 10, interp_end=15, interp_pwr=0.33) {
+  
+  duration <- pmin(interp_end, duration)
+  
+  c1 <- ((interp_end - duration) / (interp_end - interp_start))^interp_pwr
+  c1 <- pmin(1, pmax(0, c1))
+                     
+  c1 * log(duration) + (1 - c1) * log(interp_end)
+}
