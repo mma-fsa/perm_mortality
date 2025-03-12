@@ -330,6 +330,8 @@ model_data.train %>%
 
 ```{r}
 
+RUN_GA <- F
+
 qtiles <- function(x) {
   unique(quantile(x, probs=seq(0.05, 0.95, by=0.05)))
 }
@@ -341,9 +343,13 @@ ga_def <- with(model_data.train, {
       smoker_status + 
       gender * ATT_AGE +
       FACE_BAND + 
-      log_duration_interp * ISSUE_AGE - 1,
+      log_duration_interp +
+      ISSUE_AGE:smoker_status:preferred_class +
+      ISSUE_AGE:smoker_status:preferred_class:log_duration_interp - 1,
     # offset term
     offset = log(expected_deaths_08_vbt_ult),
+    # eval
+    eval_metric = "AIC",
     # define knot search
     ATT_AGE = ga_knot_def_ns(
       attained_age,
@@ -370,30 +376,30 @@ ga_def$eval_bitstr(fake_bitstr)
 
 ```{r}
 
-best_model <- GA::ga(type="binary", 
-       ga_def$eval_bitstr, 
-       popSize=10, 
-       nBits = ga_def$total_bits, 
-       maxiter = 50, 
-       parallel = F,
-       pmutation = 0.3,
-       elitism = 1,
-       suggestions = ga_def$initial_suggestions,
-       pcrossover=0.7)
+if (RUN_GA) {
+  best_model <- GA::ga(type="binary", 
+         ga_def$eval_bitstr, 
+         popSize=10, 
+         nBits = ga_def$total_bits, 
+         maxiter = 25, 
+         parallel = 5,
+         pmutation = 0.3,
+         elitism = 1,
+         suggestions = ga_def$initial_suggestions,
+         pcrossover=0.7)
+}
 
 ```
 
 ```{r}
 
-ga_def$bitstr_to_formula(best_model@solution)
+if (RUN_GA) {
+  ga_def$bitstr_to_formula(best_model@solution)
+}
+
 
 ```
 
-```{r}
-
-ga_def$bitstr_to_formula(best_model@solution)
-
-```
 
 ### Setup GLMNet recipe
 
@@ -402,13 +408,13 @@ ga_def$bitstr_to_formula(best_model@solution)
 best_formula <- number_of_deaths ~ 
   preferred_class + 
   smoker_status + 
-  splines::bs(face_amount_band_int, Boundary.knots = c(1, 11), knots = c(2, 9), degree = 1) + 
-  # gender + attained age interaction
   gender * 
-    splines::ns(attained_age, Boundary.knots = c(25, 95), knots = c(29, 33, 41, 63, 69)) + 
-  # selection factor / policy year (UW) and issue age interaction
-  log_duration_interp * 
-    splines::ns(issue_age, Boundary.knots = c(18, 75), knots = c(31, 39, 64)) - 1
+    splines::ns(attained_age, Boundary.knots = c(25, 95), knots = c(44, 49, 60, 63, 66, 72, 84)) + 
+  splines::bs(face_amount_band_int,  Boundary.knots = c(1, 11), knots = c(2, 4, 5, 6, 9, 10), degree = 1) +
+  log_duration_interp + 
+  splines::ns(issue_age, Boundary.knots = c(18, 75), knots = c(22, 31, 36, 47, 58,61)):smoker_status:preferred_class + 
+  splines::ns(issue_age, Boundary.knots = c(18, 75), knots = c(22, 31, 36, 47, 58, 
+        61)):smoker_status:preferred_class:log_duration_interp - 1
 
 X_mat <- model.matrix(best_formula, data=model_data.train)
 
@@ -436,20 +442,26 @@ final_model <- glmnet::glmnet(
   
 aic_bic <- calc_aic_bic_glmnet(final_model)
 
-min(aic_bic$BIC)
+min(aic_bic$AIC)
 
 ```
-
 
 ### Plot Deviance Ratio vs. Lambda
 
 ```{r}
 
-BEST_LAMBDA_IDX <- 80
+BEST_LAMBDA_IDX <- 100
 
 best_lambda_val <- final_model$lambda[BEST_LAMBDA_IDX]
 plot(final_model$dev.ratio, type="l")
 points(BEST_LAMBDA_IDX, final_model$dev.ratio[BEST_LAMBDA_IDX])
+
+```
+### Model coefs
+
+```{r}
+
+#coef(final_model)[,BEST_LAMBDA_IDX] 
 
 ```
 
@@ -539,115 +551,149 @@ rpart.plot(rpart_model, digits=3)
 
 ### Look for patterns in misprediction
 
+The 60-70 year olds in the training set perform reasonably well, but the
+testing set does not.  Something likely shifted in the underlying exposure
+that can't be determined with the ILEC data.  Looking at the mortality rates
+(final plot), Male mortality nose-dives for 2018
 
+#### Check train vs. test fit
 
-### Examine model factors
+* Train fit looks good
+
+* Test fit shows major differences in 60-70 
 
 ```{r}
 
-best_coefs <- predict.glmnet(
-  final_model, newx=X_mat, s=best_lambda_val, type = "coefficients"
-)
+attage_grps <- c(-Inf, seq(30, 70, by=10) ,Inf)
 
-predictor_groups <- tibble(
-  term_name = best_coefs@Dimnames[[1]]
+plot_data <- model_data.train %>%
+  mutate(
+    attage_grp = cut(attained_age, !!attage_grps, ordered_result = T)
   ) %>%
-  mutate(
-    term_group = case_when(
-      stringr::str_detect(term_name, fixed("Intercept")) ~ "factor_base_rate",
-      stringr::str_detect(term_name, fixed("preferred_class")) ~ "factor_preferred_class",
-      stringr::str_detect(term_name, fixed("smoker_status")) ~ "factor_smoker_status",
-      stringr::str_detect(term_name, fixed("gender")) |
-        stringr::str_detect(term_name, fixed("attained_age")) ~ "factor_gender_x_attained_age",
-      stringr::str_detect(term_name, fixed("issue_age")) |
-        stringr::str_detect(term_name, fixed("duration")) ~ "factor_issue_age_x_duration",
-      stringr::str_detect(term_name, fixed("face_amount_band_int")) ~ "factor_face_amount"
-    )
-  )
-
-predictor_groups %>% view()
-```
-
-
-
-```{r}
-
-pred_grid <- expand.grid(
-  face_amount_band_int = seq(min(df_ph_data.train$face_amount_band_int), max(df_ph_data.train$face_amount_band_int), by=1),
-  attained_age = seq(min(df_ph_data.train$attained_age), max(df_ph_data.train$attained_age), by=1),
-  duration = seq(min(df_ph_data.train$duration), max(df_ph_data.train$duration), by=1),
-  issue_age = seq(min(df_ph_data.train$issue_age), max(df_ph_data.train$issue_age), by=1),
-  gender = unique(df_ph_data.train$gender),
-  number_of_preferred_classes = unique(df_ph_data.train$number_of_preferred_classes),
-  preferred_class = unique(df_ph_data.train$preferred_class),
-  smoker_status = unique(df_ph_data.train$smoker_status),
-  number_of_deaths = 0, 
-  stringsAsFactors = F) %>% 
-  filter(
-    issue_age + duration - 1 == attained_age,
-    ((smoker_status == "NONSMOKER") | ((smoker_status == "SMOKER") & (number_of_preferred_classes == "2"))),
-    (
-      ((number_of_preferred_classes == "2") & (preferred_class %in% c("1", "2"))) |
-      ((number_of_preferred_classes == "3") & (preferred_class %in% c("1", "2", "3")))
-    )) %>%
-  prep_log_interp()
-
-X_pred_grid <- cbind(
-  rep(1, nrow(pred_grid)),
-  model.matrix(best_formula, data=pred_grid)
-)
-
-coeff_diag <- rep(0, best_coefs@Dim[1])
-coeff_diag[best_coefs@i + 1] <- best_coefs@x
-coeff_diag <- diag(coeff_diag)
-
-pred_mat <- X_pred_grid %*% coeff_diag
-colnames(pred_mat) <- best_coefs@Dimnames[[1]]
-
-pred_df <- pred_mat %>%
-  as.data.frame() %>%
-  mutate(
-    pred_idx = row_number()) %>%
-  pivot_longer(
-    cols=-c(pred_idx), 
-    names_to = "term_name", 
-    values_to = "term_value") %>%
-  inner_join(predictor_groups, by="term_name") %>%
-  group_by(pred_idx, term_group) %>%
+  group_by(attage_grp, preferred_class, duration) %>%
   summarise(
-    total_value = exp(sum(term_value)),
-    .groups = "drop"
-  ) %>%
-  ungroup() %>%
-  pivot_wider(
-    id_cols = pred_idx, names_from = "term_group", values_from = "total_value"
+    pred_deaths = sum(pred_deaths),
+    number_of_deaths = sum(number_of_deaths),
+    .groups="drop"
   )
 
-full_pred_df <- bind_cols(
-  pred_grid,
-  pred_df
-)
+ggplot(plot_data, aes(
+  x=duration, 
+  y=log(number_of_deaths / pred_deaths), 
+  group=preferred_class, 
+  color=preferred_class)) +
+  facet_wrap(~ attage_grp, ncol=3, scales="free_y") +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  geom_hline(yintercept = 0)
+
+```
+```{r}
+
+attage_grps <- c(-Inf, seq(30, 70, by=10) ,Inf)
+
+plot_data <- model_data.test %>%
+  mutate(
+    attage_grp = cut(attained_age, !!attage_grps, ordered_result = T)
+  ) %>%
+  group_by(attage_grp, duration, preferred_class) %>%
+  summarise(
+    pred_deaths = sum(pred_deaths),
+    number_of_deaths = sum(number_of_deaths),
+    .groups="drop"
+  )
+
+ggplot(plot_data, aes(
+  x=duration, 
+  y=log(number_of_deaths / pred_deaths), 
+  group=preferred_class, 
+  color=preferred_class)) +
+  facet_wrap(~ attage_grp, ncol=3) +
+  scale_y_continuous(transform = scales::pseudo_log_trans(sigma=1)) +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  geom_hline(yintercept = 0)
+
+```
+
+#### Check mortality rates
+
+For the 60-70 year olds at duration < 15, check for dramatic changes in the morality rate.
+
+ * This allows us to see if the exposure / business-mix shifted
+ 
+ * Despite increasing exposure, the number of deaths falls off a cliff for 2018 (under-reporting?)
+
+```{r}
+
+plot_data <- df_study_data %>%
+  mutate(
+    attage_grp = cut(attained_age, !!attage_grps, ordered_result = T)
+  ) %>%
+  filter(attage_grp == "(60,70]", duration < 15) %>%
+  group_by(gender, preferred_class, observation_year) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    policies_exposed = sum(policies_exposed),
+    .groups="drop"
+  ) %>%
+  mutate(
+    MORT_RT = number_of_deaths / policies_exposed
+  ) %>%
+  arrange(gender, preferred_class, observation_year)
+
+ggplot(plot_data, aes(x=observation_year, y=MORT_RT)) +
+  facet_wrap(~ interaction(gender, preferred_class), scales="free") +
+  geom_line() +
+  theme_bw()
 
 ```
 
 ```{r}
 
-plot_data <- full_pred_df %>%
-  select(issue_age, duration, factor_issue_age_x_duration, factor_base_rate) %>%
-  distinct()
+plot_data <- df_study_data %>%
+  mutate(
+    attage_grp = cut(attained_age, !!attage_grps, ordered_result = T)
+  ) %>%
+  filter(attage_grp == "(60,70]", duration < 15) %>%
+  group_by(gender, observation_year) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    policies_exposed = sum(policies_exposed),
+    .groups="drop"
+  ) %>%
+  mutate(
+    MORT_RT = number_of_deaths / policies_exposed
+  ) %>%
+  arrange(gender, observation_year)
 
-ggplot(plot_data, aes(x=duration, y=factor_issue_age_x_duration, group=issue_age, color=issue_age)) +
-  geom_line()
+ggplot(plot_data, aes(x=observation_year, y=MORT_RT)) +
+  facet_wrap(~ gender, scales="free") +
+  geom_line() +
+  theme_bw()
 
 ```
 
-### Evaluate Model
 
 ```{r}
 
-colnames(model_data.train)
+ggplot(plot_data, aes(x=observation_year, y=policies_exposed)) +
+  facet_wrap(~ gender, scales="free") +
+  geom_line() +
+  theme_bw()
 
 ```
 
+```{r}
+
+ggplot(plot_data, aes(x=observation_year, y=number_of_deaths)) +
+  facet_wrap(~ gender, scales="free") +
+  geom_line() +
+  theme_bw()
+
+
+```
 
 

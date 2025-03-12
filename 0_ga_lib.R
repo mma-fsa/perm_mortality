@@ -12,14 +12,15 @@ ga_knot_search <- function(base_formula, knot_formula, offset=NULL,
   } 
   
   if (is.null(weight_callback)) {
-    weight_callback <- function(param_names) {
-      data.frame(
-        term_name = param_names,
-        penalty = rep(1, length(param_names)),
-        upper = rep(Inf, length(param_names)),
-        lower = rep(-Inf, length(param_names))
-      )
-    }
+    weight_callback <- carrier::crate(
+      function(param_names) {
+        data.frame(
+          term_name = param_names,
+          penalty = rep(1, length(param_names)),
+          upper = rep(Inf, length(param_names)),
+          lower = rep(-Inf, length(param_names))
+        )
+      })
   }
   
   bitstr_formula_base <- base_formula_c[[3]]
@@ -43,70 +44,87 @@ ga_knot_search <- function(base_formula, knot_formula, offset=NULL,
     }  
   }
   
-  bitstr_to_formula <- function(bitstr) {
-    
-    bitstr_proc <- bitstr
-    bitstr_formula <- bitstr_formula_base
-    
-    for (knot_name in names(knot_definitions)) {
+  bitstr_to_formula <- carrier::crate(
+    function(bitstr) {
       
-      iter_knot_def <- knot_definitions[[knot_name]]
-      iter_n_bits <- iter_knot_def$n_bits
-      iter_knot_locs <- iter_knot_def$knots
-      iter_bits <- bitstr_proc[1:iter_n_bits]
-      iter_bit_knots_selected <- iter_knot_locs[which(iter_bits == 1)]
-      iter_knot_name_pattern <- fixed(paste0("%", knot_name, "_KNOTS%"))
+      fixed <- stringr::fixed
       
-      bitstr_formula <- stringr::str_replace(
-        bitstr_formula,
-        iter_knot_name_pattern,
-        paste(iter_bit_knots_selected, collapse = ",")
+      bitstr_proc <- bitstr
+      bitstr_formula <- bitstr_formula_base
+      
+      for (knot_name in names(knot_definitions)) {
+        
+        iter_knot_def <- knot_definitions[[knot_name]]
+        iter_n_bits <- iter_knot_def$n_bits
+        iter_knot_locs <- iter_knot_def$knots
+        iter_bits <- bitstr_proc[1:iter_n_bits]
+        iter_bit_knots_selected <- iter_knot_locs[which(iter_bits == 1)]
+        iter_knot_name_pattern <- fixed(paste0("%", knot_name, "_KNOTS%"))
+        
+        bitstr_formula <- stringr::str_replace_all(
+          bitstr_formula,
+          iter_knot_name_pattern,
+          paste(iter_bit_knots_selected, collapse = ",")
+        )
+        
+        bitstr_proc <- bitstr_proc[-c(1:iter_n_bits)]
+      }
+      stats::as.formula(paste0(base_formula_c[[2]], "~", bitstr_formula))
+    },
+    knot_definitions = knot_definitions,
+    bitstr_formula_base = bitstr_formula_base,
+    base_formula_c=base_formula_c
+  )
+    
+  eval_bitstr <- carrier::crate(
+    
+    function(bitstr) {
+      
+      model_formula <- bitstr_to_formula(bitstr)
+      
+      X_mat <- stats::model.matrix(
+        model_formula,
+        data = df
       )
       
-      bitstr_proc <- bitstr_proc[-c(1:iter_n_bits)]
-    }
-    as.formula(paste0(base_formula_c[[2]], "~", bitstr_formula))
-  }
-  
-  eval_bitstr <- function(bitstr) {
+      df_wts <- weight_callback(colnames(X_mat))
+      
+      y_vec <- df[[base_formula_c[[2]]]]
+      if (!is.null(offset)) {
+        ga_fit <- glmnet::glmnet(
+          X_mat,
+          df$number_of_deaths,
+          offset = offset,
+          family = "poisson",
+          intercept = T,
+          lower.limits = df_wts$lower,
+          upper.limits = df_wts$upper,
+          penalty.factor = df_wts$penalty
+        )  
+      } else {
+        ga_fit <- glmnet::glmnet(
+          X_mat,
+          df$number_of_deaths,
+          family = "poisson",
+          intercept = T,
+          lower.limits = df_wts$lower,
+          upper.limits = df_wts$upper,
+          penalty.factor = df_wts$penalty
+        )
+      }
+      
+      aic_bic <- calc_aic_bic_glmnet(ga_fit)
+      -1*min(aic_bic[[eval_metric]])
+    },
+    bitstr_to_formula = bitstr_to_formula,
+    df=df,
+    weight_callback=weight_callback,
+    base_formula_c=base_formula_c,
+    offset=offset,
+    calc_aic_bic_glmnet=calc_aic_bic_glmnet,
+    eval_metric=eval_metric
+  )
     
-    model_formula <- bitstr_to_formula(bitstr)
-    
-    X_mat <- model.matrix(
-      model_formula,
-      data = df
-    )
-    
-    df_wts <- weight_callback(colnames(X_mat))
-    
-    y_vec <- df[[base_formula_c[[2]]]]
-    if (!is.null(offset)) {
-      ga_fit <- glmnet(
-        X_mat,
-        model_data.train$number_of_deaths,
-        offset = offset,
-        family = "poisson",
-        intercept = T,
-        lower.limits = df_wts$lower,
-        upper.limits = df_wts$upper,
-        penalty.factor = df_wts$penalty
-      )  
-    } else {
-      ga_fit <- glmnet(
-        X_mat,
-        model_data.train$number_of_deaths,
-        family = "poisson",
-        intercept = T,
-        lower.limits = df_wts$lower,
-        upper.limits = df_wts$upper,
-        penalty.factor = df_wts$penalty
-      )
-    }
-    
-    aic_bic <- calc_aic_bic_glmnet(ga_fit)
-    -1*min(aic_bic[[eval_metric]])
-  } 
-  
   # provide two initial population members:
   # an all linear model (no knots) and one
   # that is overfit (all knots)

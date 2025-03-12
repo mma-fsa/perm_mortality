@@ -55,21 +55,21 @@ make_bit_str_to_formula <- function(formula_template, spline_locations) {
   }
 }
 
-calc_aic_bic_glmnet <- function(glmnet_fit) {
+calc_aic_bic_glmnet <- carrier::crate(
+  function(glmnet_fit) {
 
-  tLL <- glmnet_fit$nulldev - deviance(glmnet_fit)
-  k <- glmnet_fit$df
-  n <- glmnet_fit$nobs
-  AICc <- -tLL+2*k+2*k*(k+1)/(n-k-1)
-  
-  BIC <- log(n)*k - tLL
-  
-  list(
-    "AIC" = AICc,
-    "BIC" = BIC
-  )
-  
-}
+    tLL <- glmnet_fit$nulldev - stats::deviance(glmnet_fit)
+    k <- glmnet_fit$df
+    n <- glmnet_fit$nobs
+    AICc <- -tLL+2*k+2*k*(k+1)/(n-k-1)
+    
+    BIC <- log(n)*k - tLL
+    
+    list(
+      "AIC" = AICc,
+      "BIC" = BIC
+    )
+  })
 
 log_interp_spline <- function(duration, interp_start = 10, interp_end=15, interp_pwr=0.33) {
   
