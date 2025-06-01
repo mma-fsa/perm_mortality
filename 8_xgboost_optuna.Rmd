@@ -1,0 +1,298 @@
+---
+title: "XGBoost with Optuna"
+author: "Mike McPhee Anderson, FSA"
+date: "2025-05-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(reticulate)
+library(xgboost)
+library(carrier)
+library(recipes)
+library(tidyverse)
+
+reticulate::use_miniconda("r-reticulate")
+optuna <- reticulate::import("optuna")
+
+```
+
+# Setup 
+
+## Load Data
+
+```{r}
+
+face_amount_order <- c(
+  "1-9999",
+  "10000-24999",
+  "25000-49999",
+  "50000-99999",
+  "100000-249999",
+  "250000-499999",
+  "500000-999999",
+  "1000000-2499999",
+  "2500000-4999999",
+  "5000000-9999999",
+  "10000000+"
+)
+
+df_study_data <- read_rds("ilec_perm_recent.rds") %>%
+  mutate(
+    train_test = ifelse(observation_year >= 2017, "TEST", "TRAIN"),
+      # no selection period, just ultimate mortality
+    expected_deaths_08_vbt_ult = coalesce(qx * policies_exposed),
+    # create ordered factor + integer representation of face amount bands
+    face_amount_band = ordered(face_amount_band, levels=!!face_amount_order),
+    face_amount_band_int = as.integer(face_amount_band),
+    issue_age = attained_age - duration + 1
+  ) %>%
+  filter(policies_exposed > 0)
+
+```
+
+
+# Perm Historical Model
+
+## Train Test Split
+
+```{r}
+
+df_ph_data <- df_study_data 
+
+df_ph_data.train <- df_ph_data %>% 
+  filter(train_test == "TRAIN")
+
+df_ph_data.test <- df_ph_data %>%
+  filter(train_test == "TEST")
+
+df_ph_data %>%
+  group_by(train_test) %>%
+  summarise(
+    n_deaths = sum(number_of_deaths),
+    .groups="drop"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    pct_deaths = n_deaths / sum(n_deaths)
+  )
+
+```
+
+## Data Prep
+
+```{r}
+
+group_model_data <- function(df) {
+  df %>%
+    group_by(attained_age, duration, issue_age, number_of_preferred_classes,
+             preferred_class, smoker_status, face_amount_band_int, gender) %>%
+    summarise(
+      number_of_deaths = sum(number_of_deaths),
+      policies_exposed = sum(policies_exposed),
+      expected_deaths_08_vbt_ult = sum(expected_deaths_08_vbt_ult),
+      .groups="drop"
+    ) %>%
+    ungroup()
+}
+
+step_my_model_factor_prep <- function(recipe) {
+  recipe %>% step_mutate(
+    issue_age = pmin(issue_age, 75),
+    attained_age = pmin(attained_age, 95),
+    # group 3-class with the 2-class, there isn't much of it
+    preferred_class = case_when(
+      # group super-pref & pref (3-class) as pref in the 2-class
+      (number_of_preferred_classes == "3") & (preferred_class %in% c("1", "2")) ~ "1",
+      # group standard as standard in the 2-class
+      (number_of_preferred_classes == "3") & (preferred_class %in% c("3")) ~ "2",
+      # set the NA (smoker distinct) classes to be "standard" in the two class, the
+      # number of classes will be available to the model, but this gives it the option
+      # of grouping standard in 2 class w/ the non-preferred classes, it also makes
+      # default levels cleaner
+      (number_of_preferred_classes == "NA") ~ "2",
+      TRUE ~ preferred_class
+    ),
+    # set 3-class as 2-class, since applied the grouping above
+    number_of_preferred_classes = case_when(
+      number_of_preferred_classes == "3" ~ "2",
+      number_of_preferred_classes == "NA" ~ "1",
+      TRUE ~ number_of_preferred_classes
+    ),
+    # set factors w/ default levels
+    #number_of_preferred_classes = factor(number_of_preferred_classes, levels=c("2")),
+    preferred_class = factor(preferred_class, levels=c("2", "1")),
+    smoker_status = factor(smoker_status, levels=c("NONSMOKER", "SMOKER")),
+    gender = factor(gender, levels=c("MALE", "FEMALE"))
+  ) 
+}
+
+model_data.train <- df_ph_data.train %>% group_model_data()
+model_data.test <- df_ph_data.test %>% group_model_data()
+
+xgb_recipe <- recipe( ~ face_amount_band_int + 
+                             attained_age + 
+                             duration + 
+                             issue_age +
+                             gender +
+                             number_of_preferred_classes +
+                             preferred_class +
+                             smoker_status + 
+                             policies_exposed,
+                           data = model_data.train) %>%
+  step_my_model_factor_prep() %>%
+  step_mutate(
+    selection_group = interaction(smoker_status, preferred_class)
+  ) %>%
+  step_dummy(all_factor_predictors()) %>%
+  prep(model_data.train, retain=F)
+
+bake(xgb_recipe, model_data.train) %>%
+  summary()
+
+```
+
+```{r}
+
+prep_xgb_data <- carrier::crate(
+  function(df) {
+    
+    bake <- recipes::bake
+    `%>%` <- magrittr::`%>%`
+    
+    X_mat <- bake(xgb_recipe, df) %>%
+      dplyr::select(-number_of_preferred_classes) %>%
+      as.matrix()
+    
+    xgb_info <- list(X_mat)
+    xgb_data <- list(
+      "X_mat" = X_mat
+    )
+    
+    if ("expected_deaths_08_vbt_ult" %in% colnames(df)) {
+      
+      if (sum(df$expected_deaths_08_vbt_ult <= 0) > 0) {
+        stop("expected_deaths_08_vbt_ult contains negative / zero values")
+      }
+      
+      l_base_margin <- log(df$expected_deaths_08_vbt_ult)
+      
+      xgb_data[["offset"]] <- l_base_margin
+      xgb_info[["base_margin"]] <- l_base_margin
+      
+    } else {
+      warning("No base_margin provided")
+    }
+    
+    if ("number_of_deaths" %in% colnames(df)) {
+      xgb_data[["y"]] <- df$number_of_deaths
+      xgb_info[["label"]] <- df$number_of_deaths
+    }
+    xgb_data[["dmat"]] <- do.call(
+      xgboost::xgb.DMatrix,
+      xgb_info
+    )
+      
+    xgb_data
+  },
+  xgb_recipe = xgb_recipe)
+
+xgb_train <- model_data.train %>%
+  prep_xgb_data()
+
+xgb_test <- model_data.test %>%
+  prep_xgb_data()
+
+```
+
+```{r}
+
+xgb_params <- list(
+  "eta" = 0.1,
+  "gamma" = 1,
+  "max_depth" = 3,
+  "subsample" = 0.5,
+  "colsample_bytree" = 0.7,
+  "objective" = "count:poisson"
+)
+
+xgb_model <- xgboost::xgb.train(
+  params = xgb_params,
+  xgb_train$dmat,
+  nrounds = 1000,
+  watchlist = list(validation=xgb_test$dmat),
+  early_stopping_rounds = 10,
+  nthread=-1,
+  print_every_n = 100
+)
+
+xgb_model$evaluation_log$validation_poisson_nloglik %>% tail(1)
+
+```
+
+```{r}
+
+best_model_info <- environment()
+best_model_info$best_score <- Inf
+best_model_info$best_model <- NULL
+
+objective_fn <- carrier::crate(
+  function(trial) {
+    t_gamma <- trial$suggest_float("gamma", 0, 10)
+    t_max_depth <- trial$suggest_int("max_depth", 2, 6)
+    t_min_child_weight <- trial$suggest_int("min_child_weight", 1, 50)
+    
+    xgb_params <- list(
+      "eta" = 0.1,
+      "gamma" = t_gamma,
+      "max_depth" = t_max_depth,
+      "subsample" = 0.5,
+      "min_child_weight" = t_min_child_weight,
+      "colsample_bytree" = 0.7,
+      "objective" = "count:poisson"
+    )
+    
+    xgb_model <- xgboost::xgb.train(
+      params = xgb_params,
+      xgb_train$dmat,
+      nrounds = 1000,
+      watchlist = list(validation=xgb_test$dmat),
+      early_stopping_rounds = 10,
+      nthread=-1,
+      print_every_n = 100
+    )
+    
+    if (xgb_model$best_score < best_model_info$best_score) {
+      print("updating")
+      best_model_info$best_score <- xgb_model$best_score
+      best_model_info$best_model <- xgb_model
+    }
+    
+    xgb_model$best_score
+  },
+  xgb_train = xgb_train,
+  xgb_test = xgb_test,
+  best_model_info = best_model_info)
+
+```
+
+
+```{r}
+
+# Create a study with TPE sampler
+study <- optuna$create_study(sampler = optuna$samplers$TPESampler(), direction="minimize")
+study$optimize(objective_fn, n_trials = 25L)
+
+# Retrieve the best parameters
+best_params <- study$best_params
+print(best_params)
+
+```
+```{r}
+
+
+
+```
+
