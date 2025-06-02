@@ -1,0 +1,699 @@
+---
+title: "Perm Mortality Model"
+author: "Mike McPhee Anderson, FSA"
+date: "2024-12-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(glmnet)
+library(xgboost)
+library(recipes)
+library(rpart)
+library(rpart.plot)
+library(splines)
+library(rsample)
+library(shapviz)
+library(tidyselect)
+library(doMC)
+library(tidyverse)
+
+source("0_lib.R")
+source("0_ga_lib.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# Overview
+
+## Models
+
+Within the ILEC data "Perm" (permanent) life insurance category, there
+are some major differences in the underwriting / target market that can be inferred via EDA. 
+These differences lead us to three distinct models:
+
+ 1. *Simplified Issue:* Policies issued after 2005 without any preferred classes are likely simplified
+   issue.  These policies are less than $100K face amount, and are likely to have less stringent underwriting.
+   
+ 2. *Fully Underwritten (recent):*  Post-2005 policies are likely to have at least one preferred class, and I recall that blood testing gained traction in the late 1990s.  These policies will also have some underwriting class selection (select period) that is still applicable.
+ 
+ 3. *Fully Underwritten (historical):*  Policies prior to 2005 are likely to have little remaining effects from underwriting selection.  Also, this data is unlikely to have preferred classes, and is mostly just smoker vs. non-smoker for underwriting classes.  The majority of it will be smaller face amounts.
+ 
+## Training and Testing Splits
+
+Unfortunately, the ILEC data is aggregated in such a way that makes a typical train / test split cumbersome. While we could sample the exposures and deaths for each aggregated cell, things like fractional exposures and the actuarial custom of setting deaths to have a full year of exposure introduce some opportunities for noise.  
+
+Instead, we'll use the most recent two years of data for testing, and perform cross-validation within the training set by observation year.  This is more closely aligned with what an "unseen observation" is in practice, i.e., another calendar year of data.  
+
+# Setup 
+
+## Load Data
+
+```{r}
+
+face_amount_order <- c(
+  "1-9999",
+  "10000-24999",
+  "25000-49999",
+  "50000-99999",
+  "100000-249999",
+  "250000-499999",
+  "500000-999999",
+  "1000000-2499999",
+  "2500000-4999999",
+  "5000000-9999999",
+  "10000000+"
+)
+
+df_study_data <- read_rds("ilec_perm_recent.rds") %>%
+  mutate(
+    train_test = ifelse(observation_year >= 2016, "TEST", "TRAIN"),
+      # no selection period, just ultimate mortality
+    expected_deaths_08_vbt_ult = coalesce(qx * policies_exposed),
+    # create ordered factor + integer representation of face amount bands
+    face_amount_band = ordered(face_amount_band, levels=!!face_amount_order),
+    face_amount_band_int = as.integer(face_amount_band),
+    issue_age = attained_age - duration + 1
+  ) %>%
+  filter(expected_deaths_08_vbt_ult > 0)
+
+```
+
+# Perm Historical Model
+
+## Train Test Split
+
+```{r}
+
+df_ph_data <- df_study_data 
+
+df_ph_data.train <- df_ph_data %>% 
+  filter(train_test == "TRAIN")
+
+df_ph_data.test <- df_ph_data %>%
+  filter(train_test == "TEST")
+
+df_ph_data %>%
+  group_by(train_test) %>%
+  summarise(
+    n_deaths = sum(number_of_deaths),
+    .groups="drop"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    pct_deaths = n_deaths / sum(n_deaths)
+  )
+
+```
+
+## Xgboost Model
+
+```{r}
+
+df_ph_data.train %>%
+  group_by(smoker_status, number_of_preferred_classes, preferred_class) %>%
+  summarise(
+    n_deaths = sum(number_of_deaths)
+  )
+
+```
+
+```{r}
+
+summary(df_ph_data.train)
+
+```
+
+```{r}
+
+# used by the GLM as well
+step_my_model_factor_prep <- function(recipe) {
+  recipe %>% step_mutate(
+    issue_age = pmin(issue_age, 75),
+    attained_age = pmin(attained_age, 95),
+    # group 3-class with the 2-class, there isn't much of it
+    preferred_class = case_when(
+      # group super-pref & pref (3-class) as pref in the 2-class
+      (number_of_preferred_classes == "3") & (preferred_class %in% c("1", "2")) ~ "1",
+      # group standard as standard in the 2-class
+      (number_of_preferred_classes == "3") & (preferred_class %in% c("3")) ~ "2",
+      # set the NA (smoker distinct) classes to be "standard" in the two class, the
+      # number of classes will be available to the model, but this gives it the option
+      # of grouping standard in 2 class w/ the non-preferred classes, it also makes
+      # default levels cleaner
+      (number_of_preferred_classes == "NA") ~ "2",
+      TRUE ~ preferred_class
+    ),
+    # set 3-class as 2-class, since applied the grouping above
+    number_of_preferred_classes = case_when(
+      number_of_preferred_classes == "3" ~ "2",
+      number_of_preferred_classes == "NA" ~ "1",
+      TRUE ~ number_of_preferred_classes
+    ),
+    # set factors w/ default levels
+    #number_of_preferred_classes = factor(number_of_preferred_classes, levels=c("2")),
+    preferred_class = factor(preferred_class, levels=c("2", "1")),
+    smoker_status = factor(smoker_status, levels=c("NONSMOKER", "SMOKER")),
+    gender = factor(gender, levels=c("MALE", "FEMALE"))
+  ) 
+}
+
+ph.xgb.recipe <- recipe(~ issue_age + attained_age + gender + smoker_status + duration +
+                          face_amount_band_int + number_of_preferred_classes + preferred_class,
+                        data=df_ph_data.train) %>%
+  step_my_model_factor_prep() %>%
+  step_select(-number_of_preferred_classes) %>%
+  step_dummy(all_factor_predictors()) %>%
+  prep(df_ph_data.train, retain=F)
+
+
+get_ph_xgb_mat <- function(ph.xgb.recipe, df_ph_data) {
+  
+  X_mat <- bake(ph.xgb.recipe, df_ph_data) %>% 
+    select(-attained_age) %>%
+    as.matrix()
+  y_vec <- df_ph_data$number_of_deaths
+  offset_vec <- log(df_ph_data$expected_deaths_08_vbt_ult)
+  
+  list(
+    "xgb_mat" = xgb.DMatrix(X_mat, label=y_vec, base_margin=offset_vec),
+    "X" = X_mat,
+    "y" = y_vec,
+    "offset" = offset_vec
+  )
+}
+
+X.train <- get_ph_xgb_mat(ph.xgb.recipe, df_ph_data.train)
+X.test <- get_ph_xgb_mat(ph.xgb.recipe, df_ph_data.test)
+
+```
+
+### Run the inferential model
+
+```{r}
+
+xgb_params <- list(
+  "eta" = 0.1,
+  "gamma" = 1,
+  "max_depth" = 3,
+  "subsample" = 0.5,
+  "colsample_bytree" = 0.7,
+  "objective" = "count:poisson"
+)
+
+xgb_model <- xgboost::xgb.train(
+  params = xgb_params,
+  X.train$xgb_mat,
+  nrounds = 1000,
+  watchlist = list(validation=X.test$xgb_mat),
+  early_stopping_rounds = 10,
+  nthread=-1,
+  print_every_n = 100
+)
+
+## sanity check
+list(
+  "train a/e" = round(sum(X.train$y) / sum(predict(xgb_model, X.train$xgb_mat)), 3),
+  "test a/e" = round(sum(X.test$y) / sum(predict(xgb_model, X.test$xgb_mat)), 3)
+)
+
+```
+
+### Identify most important effect(s) and interaction(s)
+
+```{r}
+
+xgboost::xgb.plot.shap(X.test$X, top_n = 6, model=xgb_model, n_col=2)
+
+```
+
+Face amount and attained age interaction is visible from below plot.
+
+```{r}
+
+sv <- shapviz::shapviz(xgb_model,
+                       X_pred = X.train$xgb_mat,
+                       X = X.train$X,
+                       interactions = T)
+
+```
+
+```{r}
+
+plot_data <- tibble(
+  issue_age = sv$X$issue_age,
+  duration = sv$X$duration,
+  factor_duration = sv$S[, "duration"] + sv$S_inter[, "duration", "issue_age"]
+) %>%
+  group_by(issue_age, duration) %>%
+  summarise(factor_duration = mean(factor_duration),
+            .groups = "drop") %>%
+  mutate(
+    age_grp = case_when(
+      issue_age < 40 ~ "<40",
+      issue_age < 60 ~ "40-59",
+      issue_age < 70 ~ "60-69",
+      TRUE ~ "70+"
+     )
+  )
+
+ggplot(plot_data, aes(x=duration, y=factor_duration, color=issue_age, group=issue_age)) +
+  facet_wrap(~ age_grp) +
+  geom_line()
+
+```
+
+## Build GLM
+
+### Identify spline locations
+
+Eyeball percentiles from SHAP plots and the cumulative percent of claims (percentiles).
+
+ * The aggregated data makes estimating percentiles using built-in functions difficult, so use the plots
+
+
+```{r}
+
+df_ph_data.train %>%
+  group_by(number_of_preferred_classes, preferred_class) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths)
+  )
+
+```
+
+### Knot Selection
+
+```{r}
+
+group_model_data <- function(df) {
+  df %>%
+    group_by(attained_age, duration, issue_age, number_of_preferred_classes,
+             preferred_class, smoker_status, face_amount_band_int, gender) %>%
+    summarise(
+      number_of_deaths = sum(number_of_deaths),
+      expected_deaths_08_vbt_ult = sum(expected_deaths_08_vbt_ult),
+      .groups="drop"
+    ) %>%
+    ungroup()
+}
+
+model_data.train <- df_ph_data.train %>% group_model_data()
+model_data.test <- df_ph_data.test %>% group_model_data()
+
+ph.glmnet.recipe <- recipe(number_of_deaths ~ face_amount_band_int + 
+                             attained_age + 
+                             duration + 
+                             issue_age +
+                             gender +
+                             number_of_preferred_classes +
+                             preferred_class +
+                             smoker_status + 
+                             expected_deaths_08_vbt_ult,
+                           data = model_data.train) %>%
+  step_my_model_factor_prep() %>%
+  step_mutate(
+    log_duration_interp = log_interp_spline(duration, 10, 15, 0.33)
+  ) %>%
+  prep(model_data.train, retain=F)
+
+model_data.train <- bake(ph.glmnet.recipe, model_data.train) 
+model_data.test <- bake(ph.glmnet.recipe, model_data.test)
+
+model_data.train %>%
+  summary()
+
+```
+
+
+```{r}
+
+RUN_GA <- F
+
+qtiles <- function(x) {
+  unique(quantile(x, probs=seq(0.05, 0.95, by=0.05)))
+}
+
+ga_def <- with(model_data.train, {
+  ga_knot_search(
+    # define formula w/ knot search placeholders
+    number_of_deaths ~ preferred_class + 
+      smoker_status + 
+      gender * ATT_AGE +
+      FACE_BAND + 
+      log_duration_interp +
+      ISSUE_AGE:smoker_status:preferred_class +
+      ISSUE_AGE:smoker_status:preferred_class:log_duration_interp - 1,
+    # offset term
+    offset = log(expected_deaths_08_vbt_ult),
+    # eval
+    eval_metric = "AIC",
+    # define knot search
+    ATT_AGE = ga_knot_def_ns(
+      attained_age,
+      qtiles(attained_age)),
+    FACE_BAND = ga_knot_def_bs(
+      face_amount_band_int, 
+      qtiles(face_amount_band_int)
+    ),
+    ISSUE_AGE = ga_knot_def_ns(
+      issue_age, 
+      qtiles(issue_age)))
+})
+
+total_bits <- sum(vapply(ga_def$knot_definitions, function(x) { x$n_bits }, 
+                     FUN.VALUE = c(0)))
+
+fake_bitstr <- rbinom(total_bits, 1, prob=0.5)
+
+ga_def$eval_bitstr(fake_bitstr)
+
+```
+
+
+
+```{r}
+
+if (RUN_GA) {
+  best_model <- GA::ga(type="binary", 
+         ga_def$eval_bitstr, 
+         popSize=10, 
+         nBits = ga_def$total_bits, 
+         maxiter = 25, 
+         parallel = 5,
+         pmutation = 0.3,
+         elitism = 1,
+         suggestions = ga_def$initial_suggestions,
+         pcrossover=0.7)
+}
+
+```
+
+```{r}
+
+if (RUN_GA) {
+  ga_def$bitstr_to_formula(best_model@solution)
+}
+
+
+```
+
+
+### Setup GLMNet recipe
+
+```{r}
+
+best_formula <- number_of_deaths ~ 
+  preferred_class + 
+  smoker_status + 
+  gender * 
+    splines::ns(attained_age, Boundary.knots = c(25, 95), knots = c(44, 49, 60, 63, 66, 72, 84)) + 
+  splines::bs(face_amount_band_int,  Boundary.knots = c(1, 11), knots = c(2, 4, 5, 6, 9, 10), degree = 1) +
+  log_duration_interp + 
+  splines::ns(issue_age, Boundary.knots = c(18, 75), knots = c(22, 31, 36, 47, 58,61)):smoker_status:preferred_class + 
+  splines::ns(issue_age, Boundary.knots = c(18, 75), knots = c(22, 31, 36, 47, 58, 
+        61)):smoker_status:preferred_class:log_duration_interp - 1
+
+X_mat <- model.matrix(best_formula, data=model_data.train)
+
+df_wts <- tibble(
+  term_name = colnames(X_mat)) %>%
+  mutate(
+    lower_limits = case_when(
+      stringr::str_detect(term_name, fixed("log_duration_interp")) ~ 0,
+      TRUE ~ -Inf
+    ),
+    upper_limits = case_when(
+      (stringr::str_detect(term_name, fixed("issue_age"))) &
+        !(stringr::str_detect(term_name, fixed("log_duration_interp"))) ~ 0,
+      TRUE ~ Inf
+    )
+  )
+
+final_model <- glmnet::glmnet(
+    X_mat,
+    model_data.train$number_of_deaths,
+    offset = log(model_data.train$expected_deaths_08_vbt_ult),
+    family = "poisson",
+    intercept = T
+  )
+  
+aic_bic <- calc_aic_bic_glmnet(final_model)
+
+min(aic_bic$AIC)
+
+```
+
+### Plot Deviance Ratio vs. Lambda
+
+```{r}
+
+BEST_LAMBDA_IDX <- 100
+
+best_lambda_val <- final_model$lambda[BEST_LAMBDA_IDX]
+plot(final_model$dev.ratio, type="l")
+points(BEST_LAMBDA_IDX, final_model$dev.ratio[BEST_LAMBDA_IDX])
+
+```
+### Model coefs
+
+```{r}
+
+#coef(final_model)[,BEST_LAMBDA_IDX] 
+
+```
+
+### Append Predictions
+
+```{r}
+
+model_data.train[["pred_deaths"]] <- predict(
+  final_model, 
+  newx = model.matrix(best_formula, data=model_data.train),
+  s = best_lambda_val,
+  type="response",
+  newoffset = log(model_data.train$expected_deaths_08_vbt_ult)) %>%
+  c()
+
+model_data.test[["pred_deaths"]] <- predict(
+  final_model, 
+  newx = model.matrix(best_formula, data=model_data.test),
+  s = best_lambda_val,
+  type="response",
+  newoffset = log(model_data.test$expected_deaths_08_vbt_ult)) %>%
+  c()
+
+list(
+  "train A/E" = sum(model_data.train$number_of_deaths) / sum(model_data.train$pred_deaths),
+  "test A/E" = sum(model_data.test$number_of_deaths) / sum(model_data.test$pred_deaths)
+)
+
+
+```
+
+### Check Model w/ Decision Tree
+
+#### Training Set
+
+```{r fig.width=10}
+
+prep_rpart_data <- function(df) {
+  X <- df %>% 
+    select(-number_of_deaths, 
+           -expected_deaths_08_vbt_ult, 
+           -log_duration_interp,
+           -pred_deaths)
+  
+  y <- df[, c("pred_deaths", "number_of_deaths")] %>%
+    as.matrix()
+  
+  list(
+    "X" = X,
+    "y" = y
+  )
+}
+
+rpart_data <- model_data.train %>%
+  prep_rpart_data
+
+model_errors <- rpart_data$y
+
+rpart_model <- rpart(
+  model_errors ~ .,
+  data=rpart_data$X,
+  method="poisson",
+  control = rpart.control(cp=0.0001, maxdepth = 3))
+
+rpart.plot(rpart_model, digits=4)
+```
+
+#### Testing Set
+
+```{r fig.width=10}
+
+rpart_data <- model_data.test %>%
+  prep_rpart_data()
+
+model_errors <- rpart_data$y
+
+rpart_model <- rpart(
+  model_errors ~ .,
+  data=rpart_data$X,
+  method="poisson",
+  control = rpart.control(cp=0.0001, maxdepth = 3))
+
+rpart.plot(rpart_model, digits=3)
+
+
+```
+
+### Look for patterns in misprediction
+
+The 60-70 year olds in the training set perform reasonably well, but the
+testing set does not.  Something likely shifted in the underlying exposure
+that can't be determined with the ILEC data.  Looking at the mortality rates
+(final plot), Male mortality nose-dives for 2018
+
+#### Check train vs. test fit
+
+* Train fit looks good
+
+* Test fit shows major differences in 60-70 
+
+```{r}
+
+attage_grps <- c(-Inf, seq(30, 70, by=10) ,Inf)
+
+plot_data <- model_data.train %>%
+  mutate(
+    attage_grp = cut(attained_age, !!attage_grps, ordered_result = T)
+  ) %>%
+  group_by(attage_grp, preferred_class, duration) %>%
+  summarise(
+    pred_deaths = sum(pred_deaths),
+    number_of_deaths = sum(number_of_deaths),
+    .groups="drop"
+  )
+
+ggplot(plot_data, aes(
+  x=duration, 
+  y=log(number_of_deaths / pred_deaths), 
+  group=preferred_class, 
+  color=preferred_class)) +
+  facet_wrap(~ attage_grp, ncol=3, scales="free_y") +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  geom_hline(yintercept = 0)
+
+```
+```{r}
+
+attage_grps <- c(-Inf, seq(30, 70, by=10) ,Inf)
+
+plot_data <- model_data.test %>%
+  mutate(
+    attage_grp = cut(attained_age, !!attage_grps, ordered_result = T)
+  ) %>%
+  group_by(attage_grp, duration, preferred_class) %>%
+  summarise(
+    pred_deaths = sum(pred_deaths),
+    number_of_deaths = sum(number_of_deaths),
+    .groups="drop"
+  )
+
+ggplot(plot_data, aes(
+  x=duration, 
+  y=log(number_of_deaths / pred_deaths), 
+  group=preferred_class, 
+  color=preferred_class)) +
+  facet_wrap(~ attage_grp, ncol=3) +
+  scale_y_continuous(transform = scales::pseudo_log_trans(sigma=1)) +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  geom_hline(yintercept = 0)
+
+```
+
+#### Check mortality rates
+
+For the 60-70 year olds at duration < 15, check for dramatic changes in the morality rate.
+
+ * This allows us to see if the exposure / business-mix shifted
+ 
+ * Despite increasing exposure, the number of deaths falls off a cliff for 2018 (under-reporting?)
+
+```{r}
+
+plot_data <- df_study_data %>%
+  mutate(
+    attage_grp = cut(attained_age, !!attage_grps, ordered_result = T)
+  ) %>%
+  filter(attage_grp == "(60,70]", duration < 15) %>%
+  group_by(gender, preferred_class, observation_year) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    policies_exposed = sum(policies_exposed),
+    .groups="drop"
+  ) %>%
+  mutate(
+    MORT_RT = number_of_deaths / policies_exposed
+  ) %>%
+  arrange(gender, preferred_class, observation_year)
+
+ggplot(plot_data, aes(x=observation_year, y=MORT_RT)) +
+  facet_wrap(~ interaction(gender, preferred_class), scales="free") +
+  geom_line() +
+  theme_bw()
+
+```
+
+```{r}
+
+plot_data <- df_study_data %>%
+  mutate(
+    attage_grp = cut(attained_age, !!attage_grps, ordered_result = T)
+  ) %>%
+  filter(attage_grp == "(60,70]", duration < 15) %>%
+  group_by(gender, observation_year) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    policies_exposed = sum(policies_exposed),
+    .groups="drop"
+  ) %>%
+  mutate(
+    MORT_RT = number_of_deaths / policies_exposed
+  ) %>%
+  arrange(gender, observation_year)
+
+ggplot(plot_data, aes(x=observation_year, y=MORT_RT)) +
+  facet_wrap(~ gender, scales="free") +
+  geom_line() +
+  theme_bw()
+
+```
+
+
+```{r}
+
+ggplot(plot_data, aes(x=observation_year, y=policies_exposed)) +
+  facet_wrap(~ gender, scales="free") +
+  geom_line() +
+  theme_bw()
+
+```
+
+```{r}
+
+ggplot(plot_data, aes(x=observation_year, y=number_of_deaths)) +
+  facet_wrap(~ gender, scales="free") +
+  geom_line() +
+  theme_bw()
+
+
+```
+
+

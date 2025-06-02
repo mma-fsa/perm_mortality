@@ -1,0 +1,440 @@
+---
+title: "Perm Recent (GAM)"
+author: "Mike McPhee Anderson, FSA"
+date: "2025-05-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+
+library(recipes)
+library(rpart)
+library(rpart.plot)
+library(rsample)
+library(scam)
+library(mgcv)
+library(tidyselect)
+library(tidyverse)
+
+source("0_lib.R")
+source("0_ga_lib.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+# Setup 
+
+## Load Data
+
+```{r}
+
+face_amount_order <- c(
+  "1-9999",
+  "10000-24999",
+  "25000-49999",
+  "50000-99999",
+  "100000-249999",
+  "250000-499999",
+  "500000-999999",
+  "1000000-2499999",
+  "2500000-4999999",
+  "5000000-9999999",
+  "10000000+"
+)
+
+df_study_data <- read_rds("ilec_perm_recent.rds") %>%
+  mutate(
+    train_test = ifelse(observation_year >= 2017, "TEST", "TRAIN"),
+      # no selection period, just ultimate mortality
+    expected_deaths_08_vbt_ult = coalesce(qx * policies_exposed),
+    # create ordered factor + integer representation of face amount bands
+    face_amount_band = ordered(face_amount_band, levels=!!face_amount_order),
+    face_amount_band_int = as.integer(face_amount_band),
+    issue_age = attained_age - duration + 1
+  ) %>%
+  filter(policies_exposed > 0)
+
+```
+
+
+# Perm Historical Model
+
+## Train Test Split
+
+```{r}
+
+df_ph_data <- df_study_data 
+
+df_ph_data.train <- df_ph_data %>% 
+  filter(train_test == "TRAIN")
+
+df_ph_data.test <- df_ph_data %>%
+  filter(train_test == "TEST")
+
+df_ph_data %>%
+  group_by(train_test) %>%
+  summarise(
+    n_deaths = sum(number_of_deaths),
+    .groups="drop"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    pct_deaths = n_deaths / sum(n_deaths)
+  )
+
+```
+
+## Data Prep
+
+```{r}
+
+group_model_data <- function(df) {
+  df %>%
+    group_by(attained_age, duration, issue_age, number_of_preferred_classes,
+             preferred_class, smoker_status, face_amount_band_int, gender) %>%
+    summarise(
+      number_of_deaths = sum(number_of_deaths),
+      policies_exposed = sum(policies_exposed),
+      expected_deaths_08_vbt_ult = sum(expected_deaths_08_vbt_ult),
+      .groups="drop"
+    ) %>%
+    ungroup()
+}
+
+step_my_model_factor_prep <- function(recipe) {
+  recipe %>% step_mutate(
+    issue_age = pmin(issue_age, 75),
+    attained_age = pmin(attained_age, 95),
+    # group 3-class with the 2-class, there isn't much of it
+    preferred_class = case_when(
+      # group super-pref & pref (3-class) as pref in the 2-class
+      (number_of_preferred_classes == "3") & (preferred_class %in% c("1", "2")) ~ "1",
+      # group standard as standard in the 2-class
+      (number_of_preferred_classes == "3") & (preferred_class %in% c("3")) ~ "2",
+      # set the NA (smoker distinct) classes to be "standard" in the two class, the
+      # number of classes will be available to the model, but this gives it the option
+      # of grouping standard in 2 class w/ the non-preferred classes, it also makes
+      # default levels cleaner
+      (number_of_preferred_classes == "NA") ~ "2",
+      TRUE ~ preferred_class
+    ),
+    # set 3-class as 2-class, since applied the grouping above
+    number_of_preferred_classes = case_when(
+      number_of_preferred_classes == "3" ~ "2",
+      number_of_preferred_classes == "NA" ~ "1",
+      TRUE ~ number_of_preferred_classes
+    ),
+    # set factors w/ default levels
+    #number_of_preferred_classes = factor(number_of_preferred_classes, levels=c("2")),
+    preferred_class = factor(preferred_class, levels=c("2", "1")),
+    smoker_status = factor(smoker_status, levels=c("NONSMOKER", "SMOKER")),
+    gender = factor(gender, levels=c("MALE", "FEMALE"))
+  ) 
+}
+
+model_data.train <- df_ph_data.train %>% group_model_data()
+model_data.test <- df_ph_data.test %>% group_model_data()
+
+ph.glmnet.recipe <- recipe(number_of_deaths ~ face_amount_band_int + 
+                             attained_age + 
+                             duration + 
+                             issue_age +
+                             gender +
+                             number_of_preferred_classes +
+                             preferred_class +
+                             smoker_status + 
+                             policies_exposed,
+                           data = model_data.train) %>%
+  step_my_model_factor_prep() %>%
+  step_mutate(
+    selection_group = interaction(smoker_status, preferred_class)
+  ) %>%
+  prep(model_data.train, retain=F)
+
+model_data.train <- bake(ph.glmnet.recipe, model_data.train) 
+model_data.test <- bake(ph.glmnet.recipe, model_data.test)
+
+model_data.train %>%
+  summary()
+
+```
+
+## Train GAM
+
+```{r}
+
+#model_monotonic <- scam(y ~ s(x, bs = "mpi"))
+
+best_formula <- number_of_deaths ~ 
+  offset(log(policies_exposed)) + 
+  preferred_class + 
+  smoker_status + 
+  s(attained_age, by=gender, k=6) +
+  ti(issue_age, duration, by=selection_group, k=6) 
+  
+  
+```
+
+```{r}
+
+fit <- bam(best_formula, family = poisson(), data = model_data.train, nthreads = 8, select = T)
+
+summary(fit)
+
+```
+
+```{r}
+
+length(coef(fit))
+
+```
+
+```{r}
+
+best_formula <- number_of_deaths ~ 
+  offset(log(policies_exposed)) + 
+  preferred_class + 
+  smoker_status + 
+  s(attained_age, by=gender, k=6) +
+  s(pmin(duration, 10), by=selection_group, k=6, bs="mifo") 
+  
+
+```
+
+
+```{r}
+
+fit.c <- scam(best_formula, family = poisson(), data = model_data.train)
+
+summary(fit.c)
+
+```
+
+```{r}
+
+model_data.train[["MODEL_PRED"]] <- predict(
+  fit.c, newdata = model_data.train, type = "response"
+)
+
+```
+
+```{r}
+colnames(model_data.train)
+```
+
+
+```{r}
+
+plot_data <- model_data.train %>%
+  group_by(duration) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    MODEL_PRED = sum(MODEL_PRED)
+  ) %>%
+  pivot_longer(cols=-c(duration))
+
+```
+
+```{r}
+colnames(plot_data)
+```
+
+
+```{r}
+
+ggplot(plot_data, aes(x=duration, y=value, color=name)) +
+  geom_line()
+
+```
+
+```{r}
+
+test_pred_grid <- expand.grid(
+  preferred_class = unique(model_data.train$preferred_class)[1],
+  smoker_status = unique(model_data.train$smoker_status)[1],
+  gender = unique(model_data.train$gender)[1],
+  duration = seq(
+    min(model_data.train$duration),
+    max(model_data.train$duration)
+  )) %>%
+  mutate(
+    selection_group = interaction(smoker_status, preferred_class),
+    attained_age = 45, #+ duration - 1,
+    policies_exposed = 1
+  )
+
+test_pred_grid["MODEL_PRED"] <- predict(
+  fit.c, newdata=test_pred_grid, type="response"
+)
+
+test_pred_grid["LOG_MODEL_PRED"] <- predict(
+  fit.c, newdata=test_pred_grid, type="link"
+)
+
+```
+
+```{r}
+
+debug(predict.gam)
+
+```
+
+```{r}
+debug(predict.scam)
+```
+
+```{r}
+undebug(scam::predict.scam)
+```
+
+
+```{r}
+
+predict.scam(
+  fit.c, newdata=test_pred_grid, type="terms"
+) %>% rowSums() + coef(fit.c)["(Intercept)"]
+
+
+```
+
+
+```{r}
+predict(
+  fit.c, newdata=test_pred_grid, type="link"
+)
+```
+
+```{r}
+length(coef(fit.c))
+```
+
+```{r}
+predict(
+  fit.c, newdata=test_pred_grid, type="lpmatrix") %>%
+  as_data_frame() %>%
+  write_csv("X_mat.csv")
+```
+
+
+```{r}
+
+coef(fit.c) %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  write_csv("coef.csv")
+ 
+
+```
+
+
+```{r}
+
+(( * coef(fit.c)) %>%
+  rowSums()) 
+
+```
+
+
+```{r}
+
+X_mat <- predict(
+  fit.c, newdata = model_data.train, type = "lpmatrix"
+)
+
+  # preferred_class + 
+  # smoker_status + 
+  # s(attained_age, by=gender, k=6) +
+  # s(pmin(duration, 25), by=selection_group, k=6, bs="mifo") 
+
+```
+
+```{r}
+
+pred_grid <- expand.grid(
+  preferred_class = unique(model_data.train$preferred_class),
+  smoker_status = unique(model_data.train$smoker_status),
+  gender = unique(model_data.train$gender),
+  attained_age = seq(
+    min(model_data.train$attained_age),
+    max(model_data.train$attained_age)
+  ),
+  duration = seq(
+    min(model_data.train$duration),
+    max(model_data.train$duration)
+  )) %>%
+  mutate(
+    selection_group = interaction(smoker_status, preferred_class),
+    pred_id = row_number()
+  )
+
+pred_grid[["policies_exposed"]] <- rep(1, nrow(pred_grid))
+
+```
+
+```{r}
+
+df_b_vec <- data.frame(
+  term_name = names(b_vec)) %>%
+  mutate(
+    term_group = case_when(
+      stringr::str_detect(term_name, ".*?attained_age.*?gender.*?") ~ "attage_x_Gender",
+      stringr::str_detect(term_name, ".*?duration.*?selection_group.*?") ~ "uw_wearoff",
+      TRUE ~ term_name
+    )
+  )
+
+df_b_vec
+
+```
+
+```{r}
+
+X_mat <- predict(fit.c, newdata=pred_grid, type="lpmatrix")
+b_vec <- coef(fit.c)
+
+pred_mat <- (X_mat * b_vec) %>%
+  as_data_frame() 
+
+pred_mat[["pred_id"]] <- pred_grid$pred_id
+
+pred_mat <- pred_mat %>%
+  pivot_longer(
+    cols = -c(pred_id),
+    names_to = "term_name",
+    values_to = "term_value"
+  )
+
+pred_mat <- pred_mat %>%
+  inner_join(df_b_vec, by=c("term_name")) %>%
+  group_by(pred_id, term_group) %>%
+  summarise(
+    group_value = sum(term_value),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(id_cols = c(pred_id), names_from="term_group", values_from = "group_value", values_fill = 0) 
+
+pred_id_name <- colnames(pred_mat)[1]
+colnames(pred_mat) <- paste0(
+  "factor_", colnames(pred_mat)
+)
+colnames(pred_mat)[1] <- pred_id_name
+
+
+pred_grid %>% 
+  inner_join(pred_mat, by=c("pred_id")) %>%
+  write_csv("preds.csv")
+
+
+```
+
+```{r}
+
+names(b_vec)
+
+```
+
+
+

@@ -15,7 +15,10 @@ library(recipes)
 library(tidyverse)
 
 reticulate::use_miniconda("r-reticulate")
+#reticulate::conda_install("r-reticulate", packages=c("optuna", "optuna-integration", "xgboost"))
+
 optuna <- reticulate::import("optuna")
+py_xgb <- reticulate::import("xgboost")
 
 ```
 
@@ -209,40 +212,38 @@ xgb_test <- model_data.test %>%
 
 ```{r}
 
-xgb_params <- list(
-  "eta" = 0.1,
-  "gamma" = 1,
-  "max_depth" = 3,
-  "subsample" = 0.5,
-  "colsample_bytree" = 0.7,
-  "objective" = "count:poisson"
-)
-
-xgb_model <- xgboost::xgb.train(
-  params = xgb_params,
-  xgb_train$dmat,
-  nrounds = 1000,
-  watchlist = list(validation=xgb_test$dmat),
-  early_stopping_rounds = 10,
-  nthread=-1,
-  print_every_n = 100
-)
-
-xgb_model$evaluation_log$validation_poisson_nloglik %>% tail(1)
-
-```
-
-```{r}
-
 best_model_info <- environment()
 best_model_info$best_score <- Inf
 best_model_info$best_model <- NULL
 
 objective_fn <- carrier::crate(
   function(trial) {
+    
     t_gamma <- trial$suggest_float("gamma", 0, 10)
     t_max_depth <- trial$suggest_int("max_depth", 2, 6)
     t_min_child_weight <- trial$suggest_int("min_child_weight", 1, 50)
+    
+    optuna_cb <- function(trial, metric_name="poisson-nloglik") {
+      xgb_cb <- function(env = parent.frame()) {
+        
+        browser()
+        
+        i <- env$iteration
+        score <- env$bst_evaluation[1]
+        
+        trial$report(score, i)
+        
+        if (trial$should_prune()) {
+          #raise optuna.TrialPruned()
+        }
+        
+        
+      }
+      
+      attr(xgb_cb, "name") <- "cb.early.stop.optuna"
+      
+      xgb_cb
+    }
     
     xgb_params <- list(
       "eta" = 0.1,
@@ -254,11 +255,13 @@ objective_fn <- carrier::crate(
       "objective" = "count:poisson"
     )
     
+    set.seed(1234)
     xgb_model <- xgboost::xgb.train(
       params = xgb_params,
       xgb_train$dmat,
       nrounds = 1000,
-      watchlist = list(validation=xgb_test$dmat),
+      #watchlist = list(validation=xgb_test$dmat),
+      callbacks = list(optuna_cb(trial)),
       early_stopping_rounds = 10,
       nthread=-1,
       print_every_n = 100
@@ -274,25 +277,155 @@ objective_fn <- carrier::crate(
   },
   xgb_train = xgb_train,
   xgb_test = xgb_test,
-  best_model_info = best_model_info)
+  best_model_info = best_model_info,
+  optuna = optuna)
+
+```
+
+```{r}
+
+
+
+```
+
+```{r}
+
+function (stopping_rounds, maximize = FALSE, metric_name = NULL, 
+    verbose = TRUE) 
+{
+    best_iteration <- -1
+    best_ntreelimit <- -1
+    best_score <- Inf
+    best_msg <- NULL
+    metric_idx <- 1
+    
+    init <- function(env) {
+        if (length(env$bst_evaluation) == 0) 
+            stop("For early stopping, watchlist must have at least one element")
+        eval_names <- gsub("-", "_", names(env$bst_evaluation))
+        if (!is.null(metric_name)) {
+            metric_idx <<- which(gsub("-", "_", metric_name) == 
+                eval_names)
+            if (length(metric_idx) == 0) 
+                stop("'metric_name' for early stopping is not one of the following:\n", 
+                  paste(eval_names, collapse = " "), "\n")
+        }
+        if (is.null(metric_name) && length(env$bst_evaluation) > 
+            1) {
+            metric_idx <<- length(eval_names)
+            if (verbose) 
+                cat("Multiple eval metrics are present. Will use ", 
+                  eval_names[metric_idx], " for early stopping.\n", 
+                  sep = "")
+        }
+        metric_name <<- eval_names[metric_idx]
+        if (is.null(maximize)) 
+            maximize <<- grepl("(_auc|_map|_ndcg)", metric_name)
+        if (verbose && NVL(env$rank, 0) == 0) 
+            cat("Will train until ", metric_name, " hasn't improved in ", 
+                stopping_rounds, " rounds.\n\n", sep = "")
+        best_iteration <<- 1
+        if (maximize) 
+            best_score <<- -Inf
+        env$stop_condition <- FALSE
+        if (!is.null(env$bst)) {
+            if (!inherits(env$bst, "xgb.Booster")) 
+                stop("'bst' in the parent frame must be an 'xgb.Booster'")
+            if (!is.null(best_score <- xgb.attr(env$bst$handle, 
+                "best_score"))) {
+                best_score <<- as.numeric(best_score)
+                best_iteration <<- as.numeric(xgb.attr(env$bst$handle, 
+                  "best_iteration")) + 1
+                best_msg <<- as.numeric(xgb.attr(env$bst$handle, 
+                  "best_msg"))
+            }
+            else {
+                xgb.attributes(env$bst$handle) <- list(best_iteration = best_iteration - 
+                  1, best_score = best_score)
+            }
+        }
+        else if (is.null(env$bst_folds) || is.null(env$basket)) {
+            stop("Parent frame has neither 'bst' nor ('bst_folds' and 'basket')")
+        }
+    }
+    
+    finalizer <- function(env) {
+        if (!is.null(env$bst)) {
+            attr_best_score <- as.numeric(xgb.attr(env$bst$handle, 
+                "best_score"))
+            if (best_score != attr_best_score) {
+                if (abs(best_score - attr_best_score) >= 1e-14) {
+                  stop("Inconsistent 'best_score' values between the closure state: ", 
+                    best_score, " and the xgb.attr: ", attr_best_score)
+                }
+                best_score <- attr_best_score
+            }
+            env$bst$best_iteration <- best_iteration
+            env$bst$best_ntreelimit <- best_ntreelimit
+            env$bst$best_score <- best_score
+        }
+        else {
+            env$basket$best_iteration <- best_iteration
+            env$basket$best_ntreelimit <- best_ntreelimit
+        }
+    }
+    
+    callback <- function(env = parent.frame(), finalize = FALSE) {
+        if (best_iteration < 0) 
+            init(env)
+        if (finalize) 
+            return(finalizer(env))
+        
+        i <- env$iteration
+        score <- env$bst_evaluation[metric_idx]
+        
+        if ((maximize && score > best_score) || (!maximize && 
+            score < best_score)) {
+            best_msg <<- .format_eval_string(i, env$bst_evaluation, 
+                env$bst_evaluation_err)
+            best_score <<- score
+            best_iteration <<- i
+            best_ntreelimit <<- best_iteration * env$num_parallel_tree
+            if (!is.null(env$bst)) {
+                xgb.attributes(env$bst) <- list(best_iteration = best_iteration - 
+                  1, best_score = best_score, best_msg = best_msg, 
+                  best_ntreelimit = best_ntreelimit)
+            }
+        }
+        
+        else if (i - best_iteration >= stopping_rounds) {
+            env$stop_condition <- TRUE
+            env$end_iteration <- i
+            if (verbose && NVL(env$rank, 0) == 0) 
+                cat("Stopping. Best iteration:\n", best_msg, 
+                  "\n\n", sep = "")
+        }
+    }
+    
+    attr(callback, "call") <- match.call()
+    attr(callback, "name") <- "cb.early.stop"
+    
+    callback
+}
 
 ```
 
 
 ```{r}
 
+pruner <- optuna$pruners$MedianPruner(n_warmup_steps=5)
+
 # Create a study with TPE sampler
-study <- optuna$create_study(sampler = optuna$samplers$TPESampler(), direction="minimize")
+study <- optuna$create_study(
+  sampler = optuna$samplers$TPESampler(),
+  pruner = pruner,
+  direction="minimize")
+
 study$optimize(objective_fn, n_trials = 25L)
 
 # Retrieve the best parameters
 best_params <- study$best_params
 print(best_params)
-
-```
-```{r}
-
-
 
 ```
 
