@@ -212,87 +212,11 @@ xgb_test <- model_data.test %>%
 
 ```{r}
 
-best_model_info <- environment()
-best_model_info$best_score <- Inf
-best_model_info$best_model <- NULL
-
-objective_fn <- carrier::crate(
-  function(trial) {
-    
-    t_gamma <- trial$suggest_float("gamma", 0, 10)
-    t_max_depth <- trial$suggest_int("max_depth", 2, 6)
-    t_min_child_weight <- trial$suggest_int("min_child_weight", 1, 50)
-    
-    optuna_cb <- function(trial, metric_name="poisson-nloglik") {
-      xgb_cb <- function(env = parent.frame()) {
-        
-        browser()
-        
-        i <- env$iteration
-        score <- env$bst_evaluation[1]
-        
-        trial$report(score, i)
-        
-        if (trial$should_prune()) {
-          #raise optuna.TrialPruned()
-        }
-        
-        
-      }
-      
-      attr(xgb_cb, "name") <- "cb.early.stop.optuna"
-      
-      xgb_cb
-    }
-    
-    xgb_params <- list(
-      "eta" = 0.1,
-      "gamma" = t_gamma,
-      "max_depth" = t_max_depth,
-      "subsample" = 0.5,
-      "min_child_weight" = t_min_child_weight,
-      "colsample_bytree" = 0.7,
-      "objective" = "count:poisson"
-    )
-    
-    set.seed(1234)
-    xgb_model <- xgboost::xgb.train(
-      params = xgb_params,
-      xgb_train$dmat,
-      nrounds = 1000,
-      #watchlist = list(validation=xgb_test$dmat),
-      callbacks = list(optuna_cb(trial)),
-      early_stopping_rounds = 10,
-      nthread=-1,
-      print_every_n = 100
-    )
-    
-    if (xgb_model$best_score < best_model_info$best_score) {
-      print("updating")
-      best_model_info$best_score <- xgb_model$best_score
-      best_model_info$best_model <- xgb_model
-    }
-    
-    xgb_model$best_score
-  },
-  xgb_train = xgb_train,
-  xgb_test = xgb_test,
-  best_model_info = best_model_info,
-  optuna = optuna)
-
-```
-
-```{r}
-
-
-
-```
-
-```{r}
-
-function (stopping_rounds, maximize = FALSE, metric_name = NULL, 
+create_xgb_cb <- function (stopping_rounds, trial_env, maximize = FALSE, metric_name = NULL, 
     verbose = TRUE) 
 {
+    library(xgboost)
+  
     best_iteration <- -1
     best_ntreelimit <- -1
     best_score <- Inf
@@ -321,7 +245,7 @@ function (stopping_rounds, maximize = FALSE, metric_name = NULL,
         metric_name <<- eval_names[metric_idx]
         if (is.null(maximize)) 
             maximize <<- grepl("(_auc|_map|_ndcg)", metric_name)
-        if (verbose && NVL(env$rank, 0) == 0) 
+        if (verbose && dplyr::coalesce(env$rank, 0) == 0) 
             cat("Will train until ", metric_name, " hasn't improved in ", 
                 stopping_rounds, " rounds.\n\n", sep = "")
         best_iteration <<- 1
@@ -379,10 +303,22 @@ function (stopping_rounds, maximize = FALSE, metric_name = NULL,
         i <- env$iteration
         score <- env$bst_evaluation[metric_idx]
         
+        # check w/ hyperopt if we should prune
+        trial <- trial_env$trial
+        trial$report(score, i)
+        
+        should_prune <- trial$should_prune()  
+        
         if ((maximize && score > best_score) || (!maximize && 
             score < best_score)) {
-            best_msg <<- .format_eval_string(i, env$bst_evaluation, 
-                env$bst_evaluation_err)
+            
+            best_msg <<- sprintf(
+              "Round %.0f: %.0f (%.0f)", 
+              i,
+              env$bst_evaluation,
+              env$bst_evaluation_err
+            )
+            
             best_score <<- score
             best_iteration <<- i
             best_ntreelimit <<- best_iteration * env$num_parallel_tree
@@ -396,8 +332,17 @@ function (stopping_rounds, maximize = FALSE, metric_name = NULL,
         else if (i - best_iteration >= stopping_rounds) {
             env$stop_condition <- TRUE
             env$end_iteration <- i
-            if (verbose && NVL(env$rank, 0) == 0) 
-                cat("Stopping. Best iteration:\n", best_msg, 
+            if (verbose && dplyr::coalesce(env$rank, 0) == 0) 
+                cat("Early Stopping. Best iteration:\n", best_msg, 
+                  "\n\n", sep = "")
+        }
+        
+        else if (should_prune) {
+            env$stop_condition <- TRUE
+            env$end_iteration <- i
+            trial_env$pruned <- TRUE
+            if (verbose && dplyr::coalesce(env$rank, 0) == 0) 
+                cat("Pruned Best iteration:\n", best_msg, 
                   "\n\n", sep = "")
         }
     }
@@ -413,15 +358,108 @@ function (stopping_rounds, maximize = FALSE, metric_name = NULL,
 
 ```{r}
 
+best_model_info <- environment()
+best_model_info$best_score <- Inf
+best_model_info$best_model <- NULL
+
+objective_fn <- carrier::crate(
+  function(trial) {
+    
+    t_gamma <- trial$suggest_float("gamma", 0, 10)
+    t_max_depth <- trial$suggest_int("max_depth", 2, 6)
+    t_min_child_weight <- trial$suggest_int("min_child_weight", 1, 50)
+    
+    stopping_rounds <- 10
+    trial_env <- environment()
+    trial_env$pruned <- F
+    
+    optuna_cb <- create_xgb_cb(
+      stopping_rounds, trial_env, metric_name = "validation_poisson_nloglik"
+    )
+    
+    xgb_params <- list(
+      "eta" = 0.1,
+      "gamma" = t_gamma,
+      "max_depth" = t_max_depth,
+      "subsample" = 0.5,
+      "min_child_weight" = t_min_child_weight,
+      "colsample_bytree" = 0.7,
+      "objective" = "count:poisson"
+    )
+    
+    set.seed(1234)
+    xgb_model <- xgboost::xgb.train(
+      params = xgb_params,
+      xgb_train$dmat,
+      nrounds = 1000,
+      watchlist = list(validation=xgb_test$dmat),
+      callbacks = list(optuna_cb),
+      early_stopping_rounds = 10,
+      nthread=-1,
+      print_every_n = 100
+    )
+    
+    if (xgb_model$best_score < best_model_info$best_score) {
+      print("updating")
+      best_model_info$best_score <- xgb_model$best_score
+      best_model_info$best_model <- xgb_model
+    }
+    
+    if (trial_env$pruned) {
+      reticulate::py_run_string("import optuna")
+      reticulate::py_run_string("raise optuna.TrialPruned()")
+    }
+    
+    xgb_model$best_score
+  },
+  xgb_train = xgb_train,
+  xgb_test = xgb_test,
+  best_model_info = best_model_info,
+  create_xgb_cb = create_xgb_cb,
+  optuna = optuna)
+
+```
+
+```{r}
+
 pruner <- optuna$pruners$MedianPruner(n_warmup_steps=5)
+
+initial_params <- list(
+  list(
+    "gamma" = 0,
+    "max_depth" = 4,
+    "min_child_weight" = 20
+  ),
+  list(
+    "gamma" = 0,
+    "max_depth" = 4,
+    "min_child_weight" = 0
+  ),
+  list(
+    "gamma" = 1,
+    "max_depth" = 4,
+    "min_child_weight" = 0
+  ),
+  list(
+    "gamma" = 1,
+    "max_depth" = 4,
+    "min_child_weight" = 20
+  )
+)
+
+n_initial_params = length(initial_params)
 
 # Create a study with TPE sampler
 study <- optuna$create_study(
-  sampler = optuna$samplers$TPESampler(),
+  sampler = optuna$samplers$TPESampler(n_startup_trials=n_initial_params),
   pruner = pruner,
   direction="minimize")
 
-study$optimize(objective_fn, n_trials = 25L)
+for (i in 1:n_initial_params) {
+  study$enqueue_trial(initial_params[[i]])
+}
+
+study$optimize(objective_fn, n_trials = 100L)
 
 # Retrieve the best parameters
 best_params <- study$best_params
