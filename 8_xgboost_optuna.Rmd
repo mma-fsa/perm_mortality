@@ -166,7 +166,8 @@ prep_xgb_data <- carrier::crate(
     `%>%` <- magrittr::`%>%`
     
     X_mat <- bake(xgb_recipe, df) %>%
-      dplyr::select(-number_of_preferred_classes) %>%
+      dplyr::select(-number_of_preferred_classes,
+                    -policies_exposed) %>%
       as.matrix()
     
     xgb_info <- list(X_mat)
@@ -213,7 +214,7 @@ xgb_test <- model_data.test %>%
 ```{r}
 
 create_xgb_cb <- function (stopping_rounds, trial_env, maximize = FALSE, metric_name = NULL, 
-    verbose = TRUE) 
+    verbose = TRUE, min_iterations = 25) 
 {
     library(xgboost)
   
@@ -304,10 +305,13 @@ create_xgb_cb <- function (stopping_rounds, trial_env, maximize = FALSE, metric_
         score <- env$bst_evaluation[metric_idx]
         
         # check w/ hyperopt if we should prune
-        trial <- trial_env$trial
-        trial$report(score, i)
-        
-        should_prune <- trial$should_prune()  
+        if ((i >= min_iterations) && (i %% 25 == 0)) {
+          trial <- trial_env$trial
+          trial$report(score, i)
+          should_prune <- trial$should_prune()
+        } else {
+          should_prune <- F
+        }
         
         if ((maximize && score > best_score) || (!maximize && 
             score < best_score)) {
@@ -464,6 +468,25 @@ study$optimize(objective_fn, n_trials = 100L)
 # Retrieve the best parameters
 best_params <- study$best_params
 print(best_params)
+
+```
+
+```{r}
+
+study$best_params
+
+```
+
+```{r fig.width=8}
+
+xgboost::xgb.plot.shap(
+  xgb_train$X_mat,
+  model = best_model_info$best_model,
+  top_n = 9,
+  n_col = 3 
+)
+
+
 
 ```
 
