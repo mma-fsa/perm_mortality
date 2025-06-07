@@ -370,8 +370,10 @@ objective_fn <- carrier::crate(
   function(trial) {
     
     t_gamma <- trial$suggest_float("gamma", 0, 10)
-    t_max_depth <- trial$suggest_int("max_depth", 2, 6)
+    #t_max_depth <- trial$suggest_int("max_depth", 2, 6)
     t_min_child_weight <- trial$suggest_int("min_child_weight", 1, 50)
+    t_lambda <- trial$suggest_float("lambda", 0, 3)
+    t_alpha <- trial$suggest_float("alpha", 0, 3)
     
     stopping_rounds <- 10
     trial_env <- environment()
@@ -384,9 +386,11 @@ objective_fn <- carrier::crate(
     xgb_params <- list(
       "eta" = 0.1,
       "gamma" = t_gamma,
-      "max_depth" = t_max_depth,
-      "subsample" = 0.5,
       "min_child_weight" = t_min_child_weight,
+      "alpha" = t_alpha,
+      "lambda" = t_lambda,
+      "max_depth" = 4,
+      "subsample" = 0.5,
       "colsample_bytree" = 0.7,
       "objective" = "count:poisson"
     )
@@ -431,23 +435,27 @@ pruner <- optuna$pruners$MedianPruner(n_warmup_steps=5)
 initial_params <- list(
   list(
     "gamma" = 0,
-    "max_depth" = 4,
-    "min_child_weight" = 20
+    "min_child_weight" = 20,
+    "alpha" = 0,
+    "lambda" = 1
   ),
   list(
     "gamma" = 0,
-    "max_depth" = 4,
-    "min_child_weight" = 0
+    "min_child_weight" = 0,
+    "alpha" = 0,
+    "lambda" = 1
   ),
   list(
     "gamma" = 1,
-    "max_depth" = 4,
-    "min_child_weight" = 0
+    "min_child_weight" = 0,
+    "alpha" = 0,
+    "lambda" = 1
   ),
   list(
     "gamma" = 1,
-    "max_depth" = 4,
-    "min_child_weight" = 20
+    "min_child_weight" = 20,
+    "alpha" = 0,
+    "lambda" = 1
   )
 )
 
@@ -470,6 +478,22 @@ best_params <- study$best_params
 print(best_params)
 
 ```
+
+```{r}
+
+scores <- sapply(study$trials, function(x) x$value, simplify=T)
+params <- sapply(study$trials, function(x) x$params, simplify=T)
+
+hist(scores)
+
+```
+
+```{r}
+
+params[, which(scores < min(scores) + sd(scores))]
+
+```
+
 
 ```{r}
 
