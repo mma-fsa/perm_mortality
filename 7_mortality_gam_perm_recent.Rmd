@@ -172,15 +172,22 @@ best_formula <- number_of_deaths ~
   offset(log(policies_exposed)) + 
   preferred_class + 
   smoker_status + 
-  s(attained_age, by=gender, k=6) +
-  ti(issue_age, duration, by=selection_group, k=6) 
+  s(attained_age, by=gender, k = 16) +
+  s(attained_age, by=selection_group, k = 16) +
+  ti(issue_age, duration, by=selection_group, k=16) 
   
   
 ```
 
 ```{r}
 
-fit <- bam(best_formula, family = poisson(), data = model_data.train, nthreads = 8, select = T)
+fit <- bam(
+  best_formula, 
+  family = poisson(), 
+  data = model_data.train, 
+  nthreads = 8,
+  gamma = 0.01,
+  discrete=T)
 
 summary(fit)
 
@@ -188,9 +195,33 @@ summary(fit)
 
 ```{r}
 
-length(coef(fit))
+model_data.train[["MODEL_PRED"]] <- predict(
+  fit, newdata = model_data.train, type = "response"
+)
 
 ```
+
+```{r}
+
+plot_data <- model_data.train %>%
+  group_by(duration, selection_group) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    MODEL_PRED = sum(MODEL_PRED)
+  ) %>%
+  pivot_longer(cols=-c(duration, selection_group))
+
+```
+
+```{r fig.width=10}
+
+ggplot(plot_data, aes(x=duration, y=value, color=name)) +
+  facet_wrap(~ selection_group) +
+  geom_line()
+
+```
+
+
 
 ```{r}
 
@@ -199,8 +230,8 @@ best_formula <- number_of_deaths ~
   preferred_class + 
   smoker_status + 
   s(attained_age, by=gender, k=6) +
-  s(pmin(duration, 10), by=selection_group, k=6, bs="mifo") 
-  
+  ti(duration, issue_age, by=selection_group, k=6, bs="tesmi1")
+
 
 ```
 
@@ -261,8 +292,10 @@ test_pred_grid <- expand.grid(
     max(model_data.train$duration)
   )) %>%
   mutate(
-    selection_group = interaction(smoker_status, preferred_class),
-    attained_age = 45, #+ duration - 1,
+    issue_age = 65,
+    issue_age_grp = cut(issue_age, breaks=c(-Inf, 35, seq(45, 75, by=10), Inf)),
+    selection_group = interaction(smoker_status, preferred_class, issue_age_grp),
+    attained_age = 65, #+ duration - 1,
     policies_exposed = 1
   )
 
@@ -276,20 +309,6 @@ test_pred_grid["LOG_MODEL_PRED"] <- predict(
 
 ```
 
-```{r}
-
-debug(predict.gam)
-
-```
-
-```{r}
-debug(predict.scam)
-```
-
-```{r}
-undebug(scam::predict.scam)
-```
-
 
 ```{r}
 
@@ -297,6 +316,29 @@ predict.scam(
   fit.c, newdata=test_pred_grid, type="terms"
 ) %>% rowSums() + coef(fit.c)["(Intercept)"]
 
+
+```
+
+```{r}
+
+sel_factor <- predict.scam(
+  fit.c, newdata=test_pred_grid, type="terms"
+) %>% as_tibble() %>%
+  mutate(
+    year = row_number()
+  )
+
+colnames(sel_factor)[which(sel_factor %>% colSums() %>% abs() > 0)]
+
+```
+
+
+```{r}
+
+ggplot(sel_factor, aes(
+  x=year,
+  y=exp(`s(pmin(duration, 15)):selection_groupNONSMOKER.1.(55,65]`))) +
+  geom_line()
 
 ```
 
