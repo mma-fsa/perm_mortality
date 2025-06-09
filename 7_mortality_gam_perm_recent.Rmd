@@ -14,11 +14,17 @@ library(rpart.plot)
 library(rsample)
 library(scam)
 library(mgcv)
+library(plotly)
+library(reticulate)
 library(tidyselect)
 library(tidyverse)
 
 source("0_lib.R")
 source("0_ga_lib.R")
+
+reticulate::use_miniconda("r-reticulate")
+
+optuna <- reticulate::import("optuna")
 
 knitr::opts_chunk$set(echo = TRUE)
 
@@ -166,42 +172,176 @@ model_data.train %>%
 
 ```{r}
 
-#model_monotonic <- scam(y ~ s(x, bs = "mpi"))
+best_model_info <- environment()
+best_model_info$best_score <- -Inf
+best_model_info$best_model <- NULL
 
-best_formula <- number_of_deaths ~ 
-  offset(log(policies_exposed)) + 
-  preferred_class + 
-  smoker_status + 
-  s(attained_age, by=gender, k = 16) +
-  s(attained_age, by=selection_group, k = 16) +
-  ti(issue_age, duration, by=selection_group, k=16) 
+poisson_deviance <- carrier::crate(
+  function(y, mu) {
+    eps <- .Machine$double.eps
+    y_safe <- pmax(y, eps)
+    mu_safe <- pmax(mu, eps)
+    terms <- y * (log(y_safe) - log(mu_safe)) - (y - mu)
+    2 * sum(terms)
+  })
+
+d2_metric <- carrier::crate(
+  function(y, mu_hat, mu_null) {
   
-  
-```
-
-```{r}
-
-fit <- bam(
-  best_formula, 
-  family = poisson(), 
-  data = model_data.train, 
-  nthreads = 8,
-  gamma = 0.01,
-  discrete=T)
-
-summary(fit)
-
-```
-
-```{r}
-
-model_data.train[["MODEL_PRED"]] <- predict(
-  fit, newdata = model_data.train, type = "response"
+    if (length(mu_null) == 1) {
+      mu_null <- rep(mu_null, length(y))
+    }
+    
+    resid_dev <- poisson_deviance(y, mu_hat)
+    null_dev  <- poisson_deviance(y, mu_null)
+    
+    100.0 * (null_dev - resid_dev) / null_dev
+  },
+  poisson_deviance=poisson_deviance
 )
 
+objective_fn <- carrier::crate(
+  function(trial) {
+    
+    k_attage_gender <- trial$suggest_int("k_attage_gender", 4, 32, step=4)
+    k_attage_sel_group <- trial$suggest_int("k_attage_sel_group", 4, 32, step=4)
+    k_attage_issage_dur <- trial$suggest_int("k_attage_issage_dur", 4, 32, step=4)
+    iter_gamma <- trial$suggest_float("gamma", -20, 0.5, step=0.5)
+    
+    iter_formula <- number_of_deaths ~ 
+      stats::offset(log(policies_exposed)) + 
+      preferred_class + 
+      smoker_status + 
+      s(attained_age, by=gender, k=k_attage_gender) +
+      s(attained_age, by=selection_group, k=k_attage_sel_group) +
+      ti(issue_age, duration, by=selection_group, k=k_attage_issage_dur) 
+    
+    fitting_error <- F
+    tryCatch({
+      fit <- mgcv::bam(
+        iter_formula, 
+        family = stats::poisson(), 
+        data = model_data.train, 
+        nthreads = 8,
+        gamma = 2^iter_gamma,
+        discrete=T)
+    },
+    error=function(e) {
+      fitting_error <<- T  
+    })
+    
+    perf_metric_val <- -Inf
+    if (!fitting_error) {
+      test_pred <- stats::predict(
+        fit, newdata = model_data.test, type = "response"
+      )
+      
+      perf_metric_val <- perf_metric(
+        model_data.test$number_of_deaths,
+        test_pred,
+        sum(model_data.test$number_of_deaths) / sum(model_data.test$policies_exposed) * model_data.test$policies_exposed
+      )  
+    }
+    
+    if(best_model_info$best_score < perf_metric_val) {
+      best_model_info$best_model <- fit
+      best_model_info$best_score <- perf_metric_val
+    }
+    
+    perf_metric_val
+  },
+  model_data.train = model_data.train,
+  model_data.test = model_data.test,
+  best_model_info = best_model_info,
+  perf_metric = d2_metric,
+  optuna = optuna)
+
+
 ```
 
 ```{r}
+
+initial_params <- list(
+  list(
+    "gamma" = 0,
+    "k_attage_gender" = 4,
+    "k_attage_sel_group" = 4,
+    "k_attage_issage_dur" = 4
+  ),
+  list(
+    "gamma" = -6,
+    "k_attage_gender" = 4,
+    "k_attage_sel_group" = 4,
+    "k_attage_issage_dur" = 4
+  ),
+  list(
+    "gamma" = 0,
+    "k_attage_gender" = 8,
+    "k_attage_sel_group" = 8,
+    "k_attage_issage_dur" = 8
+  ),
+  list(
+    "gamma" = -6,
+    "k_attage_gender" = 8,
+    "k_attage_sel_group" = 8,
+    "k_attage_issage_dur" = 8
+  )
+)
+
+n_initial_params = length(initial_params)
+
+#pruner <- optuna$pruners$MedianPruner(n_warmup_steps=5)
+
+# Create a study with TPE sampler
+study <- optuna$create_study(
+  sampler = optuna$samplers$TPESampler(n_startup_trials=n_initial_params),
+  #pruner = pruner,
+  direction="maximize")
+
+for (i in 1:n_initial_params) {
+  study$enqueue_trial(initial_params[[i]])
+}
+
+study$optimize(objective_fn, n_trials = 100L)
+
+# Retrieve the best parameters
+best_params <- study$best_params
+print(best_params)
+
+```
+
+## Create final fit
+
+```{r}
+
+best_formula <- number_of_deaths ~ 
+      stats::offset(log(policies_exposed)) + 
+      preferred_class + 
+      smoker_status + 
+      s(attained_age, by=gender, k=8) +
+      s(attained_age, by=selection_group, k=12) +
+      ti(issue_age, duration, by=selection_group, k=12) 
+
+fit <- mgcv::bam(
+        best_formula, 
+        family = stats::poisson(), 
+        data = model_data.train, 
+        nthreads = 8,
+        gamma = 1.5,
+        discrete=T)    
+
+```
+
+
+## Model Diagnostics
+
+```{r fig.width=10}
+
+model_data.train[["MODEL_PRED"]] <- predict(
+  best_model_info$fit,
+  newdata = model_data.train,
+  type = "response"
+)
 
 plot_data <- model_data.train %>%
   group_by(duration, selection_group) %>%
@@ -211,9 +351,27 @@ plot_data <- model_data.train %>%
   ) %>%
   pivot_longer(cols=-c(duration, selection_group))
 
+ggplot(plot_data, aes(x=duration, y=value, color=name)) +
+  facet_wrap(~ selection_group) +
+  geom_line()
+
 ```
 
 ```{r fig.width=10}
+
+model_data.test[["MODEL_PRED"]] <- predict(
+  best_model_info$fit,
+  newdata = model_data.test,
+  type = "response"
+)
+
+plot_data <- model_data.test %>%
+  group_by(duration, selection_group) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    MODEL_PRED = sum(MODEL_PRED)
+  ) %>%
+  pivot_longer(cols=-c(duration, selection_group))
 
 ggplot(plot_data, aes(x=duration, y=value, color=name)) +
   facet_wrap(~ selection_group) +
@@ -221,262 +379,98 @@ ggplot(plot_data, aes(x=duration, y=value, color=name)) +
 
 ```
 
-
+## Build full pred grid
 
 ```{r}
-
-best_formula <- number_of_deaths ~ 
-  offset(log(policies_exposed)) + 
-  preferred_class + 
-  smoker_status + 
-  s(attained_age, by=gender, k=6) +
-  ti(duration, issue_age, by=selection_group, k=6, bs="tesmi1")
-
-
+unique(model_data.train$number_of_preferred_classes)
 ```
 
 
 ```{r}
 
-fit.c <- scam(best_formula, family = poisson(), data = model_data.train)
-
-summary(fit.c)
-
-```
-
-```{r}
-
-model_data.train[["MODEL_PRED"]] <- predict(
-  fit.c, newdata = model_data.train, type = "response"
-)
-
-```
-
-```{r}
 colnames(model_data.train)
+
 ```
 
 
 ```{r}
 
-plot_data <- model_data.train %>%
-  group_by(duration) %>%
-  summarise(
-    number_of_deaths = sum(number_of_deaths),
-    MODEL_PRED = sum(MODEL_PRED)
-  ) %>%
-  pivot_longer(cols=-c(duration))
-
-```
-
-```{r}
-colnames(plot_data)
-```
-
-
-```{r}
-
-ggplot(plot_data, aes(x=duration, y=value, color=name)) +
-  geom_line()
-
-```
-
-```{r}
-
-test_pred_grid <- expand.grid(
-  preferred_class = unique(model_data.train$preferred_class)[1],
-  smoker_status = unique(model_data.train$smoker_status)[1],
-  gender = unique(model_data.train$gender)[1],
-  duration = seq(
-    min(model_data.train$duration),
-    max(model_data.train$duration)
-  )) %>%
+df_pred_grid <- with(model_data.train, {
+  expand.grid(
+    attained_age = seq(min(attained_age), max(attained_age)),
+    duration = seq(min(duration), max(duration)),
+    preferred_class = unique(preferred_class),
+    smoker_status = unique(smoker_status),
+    face_amount_band_int = seq(min(face_amount_band_int), max(face_amount_band_int)),
+    gender = unique(gender)
+  )
+  }) %>%
+  as_tibble() %>%
   mutate(
-    issue_age = 65,
-    issue_age_grp = cut(issue_age, breaks=c(-Inf, 35, seq(45, 75, by=10), Inf)),
-    selection_group = interaction(smoker_status, preferred_class, issue_age_grp),
-    attained_age = 65, #+ duration - 1,
-    policies_exposed = 1
+    issue_age = attained_age - duration + 1,
+    policies_exposed = 1,
+    selection_group = interaction(smoker_status, preferred_class)
   )
 
-test_pred_grid["MODEL_PRED"] <- predict(
-  fit.c, newdata=test_pred_grid, type="response"
-)
-
-test_pred_grid["LOG_MODEL_PRED"] <- predict(
-  fit.c, newdata=test_pred_grid, type="link"
-)
-
-```
-
-
-```{r}
-
-predict.scam(
-  fit.c, newdata=test_pred_grid, type="terms"
-) %>% rowSums() + coef(fit.c)["(Intercept)"]
-
+nrow(df_pred_grid)
 
 ```
 
 ```{r}
 
-sel_factor <- predict.scam(
-  fit.c, newdata=test_pred_grid, type="terms"
-) %>% as_tibble() %>%
-  mutate(
-    year = row_number()
+model_factor_data <- bind_cols(
+  df_pred_grid,
+  predict(
+    fit,
+    newdata=df_pred_grid,
+    type = "terms") %>%
+    as_tibble()) 
+
+```
+
+```{r}
+
+plot_data <- model_factor_data %>%
+  filter(
+    issue_age >= 35,
+    issue_age <= 75,
+    gender == "MALE",
+    selection_group == "NONSMOKER.1",
+    face_amount_band_int == 5) %>%
+  select(issue_age, duration, sel_factor = `ti(issue_age,duration):selection_groupNONSMOKER.1`)
+
+grid_data <- plot_data %>%
+  complete(duration = unique(plot_data$duration),
+           issue_age = unique(plot_data$issue_age)) %>%
+  arrange(issue_age, duration)
+
+# Step 3: Pivot to wide format for z matrix
+z_wide <- grid_data %>%
+  pivot_wider(names_from = duration, values_from = sel_factor)
+
+# Step 4: Extract axes and z matrix
+z_matrix <- as.matrix(z_wide[,-1])  # remove issue_age column
+y_vals <- z_wide$issue_age          # row axis: issue_age
+x_vals <- sort(unique(plot_data$duration))  # column axis: duration
+
+# Step 5: Plot surface
+fig <- plot_ly(
+  x = x_vals,
+  y = y_vals,
+  z = z_matrix,
+  type = "surface",
+  colorscale = "Viridis",
+  showscale = TRUE
+) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Duration"),
+      yaxis = list(title = "Issue Age"),
+      zaxis = list(title = "Select Factor")
+    ),
+    title = "3D Select Factor Surface"
   )
 
-colnames(sel_factor)[which(sel_factor %>% colSums() %>% abs() > 0)]
-
+fig
 ```
-
-
-```{r}
-
-ggplot(sel_factor, aes(
-  x=year,
-  y=exp(`s(pmin(duration, 15)):selection_groupNONSMOKER.1.(55,65]`))) +
-  geom_line()
-
-```
-
-
-```{r}
-predict(
-  fit.c, newdata=test_pred_grid, type="link"
-)
-```
-
-```{r}
-length(coef(fit.c))
-```
-
-```{r}
-predict(
-  fit.c, newdata=test_pred_grid, type="lpmatrix") %>%
-  as_data_frame() %>%
-  write_csv("X_mat.csv")
-```
-
-
-```{r}
-
-coef(fit.c) %>%
-  as.data.frame() %>%
-  rownames_to_column() %>%
-  write_csv("coef.csv")
- 
-
-```
-
-
-```{r}
-
-(( * coef(fit.c)) %>%
-  rowSums()) 
-
-```
-
-
-```{r}
-
-X_mat <- predict(
-  fit.c, newdata = model_data.train, type = "lpmatrix"
-)
-
-  # preferred_class + 
-  # smoker_status + 
-  # s(attained_age, by=gender, k=6) +
-  # s(pmin(duration, 25), by=selection_group, k=6, bs="mifo") 
-
-```
-
-```{r}
-
-pred_grid <- expand.grid(
-  preferred_class = unique(model_data.train$preferred_class),
-  smoker_status = unique(model_data.train$smoker_status),
-  gender = unique(model_data.train$gender),
-  attained_age = seq(
-    min(model_data.train$attained_age),
-    max(model_data.train$attained_age)
-  ),
-  duration = seq(
-    min(model_data.train$duration),
-    max(model_data.train$duration)
-  )) %>%
-  mutate(
-    selection_group = interaction(smoker_status, preferred_class),
-    pred_id = row_number()
-  )
-
-pred_grid[["policies_exposed"]] <- rep(1, nrow(pred_grid))
-
-```
-
-```{r}
-
-df_b_vec <- data.frame(
-  term_name = names(b_vec)) %>%
-  mutate(
-    term_group = case_when(
-      stringr::str_detect(term_name, ".*?attained_age.*?gender.*?") ~ "attage_x_Gender",
-      stringr::str_detect(term_name, ".*?duration.*?selection_group.*?") ~ "uw_wearoff",
-      TRUE ~ term_name
-    )
-  )
-
-df_b_vec
-
-```
-
-```{r}
-
-X_mat <- predict(fit.c, newdata=pred_grid, type="lpmatrix")
-b_vec <- coef(fit.c)
-
-pred_mat <- (X_mat * b_vec) %>%
-  as_data_frame() 
-
-pred_mat[["pred_id"]] <- pred_grid$pred_id
-
-pred_mat <- pred_mat %>%
-  pivot_longer(
-    cols = -c(pred_id),
-    names_to = "term_name",
-    values_to = "term_value"
-  )
-
-pred_mat <- pred_mat %>%
-  inner_join(df_b_vec, by=c("term_name")) %>%
-  group_by(pred_id, term_group) %>%
-  summarise(
-    group_value = sum(term_value),
-    .groups = "drop"
-  ) %>%
-  pivot_wider(id_cols = c(pred_id), names_from="term_group", values_from = "group_value", values_fill = 0) 
-
-pred_id_name <- colnames(pred_mat)[1]
-colnames(pred_mat) <- paste0(
-  "factor_", colnames(pred_mat)
-)
-colnames(pred_mat)[1] <- pred_id_name
-
-
-pred_grid %>% 
-  inner_join(pred_mat, by=c("pred_id")) %>%
-  write_csv("preds.csv")
-
-
-```
-
-```{r}
-
-names(b_vec)
-
-```
-
-
 
