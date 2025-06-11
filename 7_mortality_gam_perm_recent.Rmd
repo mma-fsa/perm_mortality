@@ -22,9 +22,9 @@ library(tidyverse)
 source("0_lib.R")
 source("0_ga_lib.R")
 
-reticulate::use_miniconda("r-reticulate")
+#reticulate::use_miniconda("r-reticulate")
 
-optuna <- reticulate::import("optuna")
+#optuna <- reticulate::import("optuna")
 
 knitr::opts_chunk$set(echo = TRUE)
 
@@ -302,11 +302,11 @@ for (i in 1:n_initial_params) {
   study$enqueue_trial(initial_params[[i]])
 }
 
-study$optimize(objective_fn, n_trials = 100L)
+#study$optimize(objective_fn, n_trials = 100L)
 
 # Retrieve the best parameters
-best_params <- study$best_params
-print(best_params)
+#best_params <- study$best_params
+#print(best_params)
 
 ```
 
@@ -380,18 +380,6 @@ ggplot(plot_data, aes(x=duration, y=value, color=name)) +
 ```
 
 ## Build full pred grid
-
-```{r}
-unique(model_data.train$number_of_preferred_classes)
-```
-
-
-```{r}
-
-colnames(model_data.train)
-
-```
-
 
 ```{r}
 
@@ -473,4 +461,156 @@ fig <- plot_ly(
 
 fig
 ```
+
+### Fit constrained model
+
+#### Prepare data
+
+```{r}
+
+mutate_sel_grp <- function(df) {
+  df %>%
+    mutate(
+      issage_grp = cut(
+        issue_age,
+        breaks = c(-Inf, seq(35, 65, by=10), Inf)
+      ),
+      selection_group_w_issage = interaction(
+        selection_group, issage_grp
+      )
+    )
+}
+
+model_data.train <- model_data.train %>%
+  mutate_sel_grp()
+
+model_data.test <- model_data.test %>%
+  mutate_sel_grp()
+
+```
+
+```{r}
+
+model_data.train %>%
+  group_by(selection_group_w_issage, duration) %>%
+  summarise(
+    number_of_deaths = sum(number_of_deaths),
+    .groups="drop"
+  ) %>%
+  ungroup() %>%
+  pivot_wider(
+    id_cols = duration, 
+    names_from = selection_group_w_issage,
+    values_from = number_of_deaths,
+    values_fill = 0) %>%
+  view()
+
+```
+
+
+```{r}
+
+constrained_model_formula <- number_of_deaths ~ 
+      stats::offset(log(policies_exposed)) + 
+      preferred_class + 
+      smoker_status + 
+      s(attained_age, by=gender, k=8) +
+      s(attained_age, by=selection_group, k=12) +
+      s(pmin(15, duration), by=selection_group_w_issage, k=8, bs="mifo") 
+
+```
+
+```{r}
+
+constrained_fit <- scam(
+        constrained_model_formula, 
+        family = stats::poisson(), 
+        data = model_data.train, 
+        gamma = 0.5)    
+
+summary(constrained_fit)
+
+```
+
+```{r}
+
+df_pred_grid <- df_pred_grid %>% 
+  mutate_sel_grp()
+
+df_term_preds <-  predict(
+  constrained_fit,
+  newdata=df_pred_grid,
+  type = "terms") %>%
+  as_tibble() %>%
+  mutate(
+    row_id = row_number()
+  ) %>%
+  pivot_longer(
+    cols = -c(row_id),
+    names_to = "term_name",
+    values_to = "term_value"
+  ) %>%
+  mutate(
+    term_group = case_when(
+      stringr::str_detect(term_name, "^s\\(attained_age\\).*") ~ "factor_attage",
+      stringr::str_detect(term_name, "^s\\(pmin\\(15, duration\\)\\).*") ~ "factor_duration",
+      TRUE ~ "other"
+    )
+  ) %>%
+  group_by(row_id, term_group) %>%
+  summarise(
+    term_value = exp(sum(term_value)),
+    .groups="drop"
+  ) %>%
+  pivot_wider(id_cols = row_id, 
+              names_from = "term_group", 
+              values_from = "term_value",
+              values_fill = 0) %>%
+  arrange(row_id)
+
+df_term_preds
+```
+
+```{r}
+
+constrained_model_factor_data <- bind_cols(
+  df_pred_grid,
+  df_term_preds
+ ) 
+
+```
+
+
+```{r}
+colnames(constrained_model_factor_data)
+```
+
+# Manually Adjust Factors
+
+```{r}
+
+constrained_model_factor_data %>%
+  select(selection_group_w_issage, duration, factor_duration) %>%
+  distinct() %>%
+  pivot_wider(id_cols = duration, 
+              names_from = selection_group_w_issage,
+              values_from =  factor_duration) %>%
+  write_csv("sel_factors.csv")
+
+```
+
+
+```{r}
+
+plot_data <- model_factor_data %>%
+  filter(
+    issue_age >= 35,
+    issue_age <= 75,
+    gender == "MALE",
+    selection_group == "NONSMOKER.1",
+    face_amount_band_int == 5) %>%
+  select(issue_age, duration, sel_factor = `ti(issue_age,duration):selection_groupNONSMOKER.1`)
+
+```
+
 
